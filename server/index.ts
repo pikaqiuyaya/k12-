@@ -2298,6 +2298,19 @@ function reconcileEmailStatusesFromTasks(): boolean {
     const related = tasks
       .filter((task) => task.emailId === email.id)
       .sort((a, b) => String(b.finishedAt || b.updatedAt || b.createdAt).localeCompare(String(a.finishedAt || a.updatedAt || a.createdAt)));
+    const latestActive = related.find((task) => task.status === "queued" || task.status === "running");
+    if (latestActive) {
+      if (email.status !== "running") {
+        email.status = "running";
+        changed = true;
+      }
+      if (email.lastTaskId !== latestActive.id) {
+        email.lastTaskId = latestActive.id;
+        changed = true;
+      }
+      continue;
+    }
+
     const latestSuccess = related.find((task) => task.status === "success");
     if (latestSuccess) {
       if (email.status !== "success") {
@@ -2320,13 +2333,36 @@ function reconcileEmailStatusesFromTasks(): boolean {
     }
 
     const latestFailed = related.find((task) => task.status === "failed");
-    if (latestFailed && email.status === "free" && !email.sub2apiAccount) {
-      email.status = "failed";
-      email.lastTaskId = latestFailed.id;
-      email.lastError = latestFailed.error || email.lastError || "";
+    if (latestFailed) {
+      if (email.status !== "failed" && !email.sub2apiAccount) {
+        email.status = "failed";
+        changed = true;
+      }
+      if (email.lastTaskId !== latestFailed.id) {
+        email.lastTaskId = latestFailed.id;
+        changed = true;
+      }
+      const nextError = latestFailed.error || email.lastError || "";
+      if (email.lastError !== nextError) {
+        email.lastError = nextError;
+        changed = true;
+      }
+      continue;
+    }
+
+    if (email.status === "running") {
+      email.status = "free";
+      delete email.lastTaskId;
+      email.lastError = "";
       changed = true;
     }
   }
+  return changed;
+}
+
+async function reconcileAndPersistEmailStatuses(): Promise<boolean> {
+  const changed = reconcileEmailStatusesFromTasks();
+  if (changed) await persistEmails();
   return changed;
 }
 
@@ -2383,12 +2419,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   const pathname = url.pathname;
 
   if (method === "GET" && pathname === "/api/health") {
+    await reconcileAndPersistEmailStatuses();
     sendJson(res, 200, {ok: true, rootDir, dataDir, summary: summary()});
     return;
   }
 
   if (method === "GET" && pathname === "/api/summary") {
+    await reconcileAndPersistEmailStatuses();
     sendJson(res, 200, summary());
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/emails/reconcile") {
+    const changed = await reconcileAndPersistEmailStatuses();
+    sendJson(res, 200, {changed, summary: summary()});
     return;
   }
 
@@ -2411,6 +2455,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (method === "GET" && pathname === "/api/emails") {
+    await reconcileAndPersistEmailStatuses();
     sendJson(res, 200, {items: emails.map(publicEmail), count: emails.length});
     return;
   }
@@ -2551,7 +2596,7 @@ async function boot(): Promise<void> {
   }
   await hydrateTaskAccessTokensFromTokenOut();
   await persistTasks();
-  if (reconcileEmailStatusesFromTasks()) await persistEmails();
+  await reconcileAndPersistEmailStatuses();
 
   createServer((req, res) => {
     void handler(req, res);
