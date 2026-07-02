@@ -547,6 +547,35 @@ async function importEmails(text: string, config = appConfig): Promise<{added: n
   return {added, updated, skipped, invalid, inputLines: lines.length, total: emails.length, invalidSamples};
 }
 
+function hasActiveTask(emailId: string): boolean {
+  return tasks.some((task) => task.emailId === emailId && (task.status === "queued" || task.status === "running"));
+}
+
+function removeEmails(ids: string[]): {removed: number; skippedRunning: number; missing: number} {
+  const requested = new Set(ids.filter(Boolean));
+  if (!requested.size) return {removed: 0, skippedRunning: 0, missing: 0};
+
+  let removed = 0;
+  let skippedRunning = 0;
+  let missing = 0;
+  const existingIds = new Set(emails.map((item) => item.id));
+  for (const id of requested) {
+    if (!existingIds.has(id)) missing += 1;
+  }
+
+  emails = emails.filter((email) => {
+    if (!requested.has(email.id)) return true;
+    if (email.status === "running" || hasActiveTask(email.id)) {
+      skippedRunning += 1;
+      return true;
+    }
+    removed += 1;
+    return false;
+  });
+
+  return {removed, skippedRunning, missing};
+}
+
 async function loadBundleModules() {
   await ensureCompatBundleConfig();
   const srcDir = path.join(appConfig.referenceBundlePath, "codex_register", "src");
@@ -2396,12 +2425,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (method === "POST" && pathname === "/api/emails/delete") {
+    const body = await readJsonBody(req);
+    let ids = Array.isArray(body.ids) ? body.ids.map((item) => String(item)).filter(Boolean) : [];
+    const status = asString(body.status);
+    if (status) {
+      const allowed = new Set(["free", "failed", "success"]);
+      if (!allowed.has(status)) {
+        sendJson(res, 400, {error: "status 只能是 free、failed 或 success"});
+        return;
+      }
+      ids = emails.filter((item) => item.status === status).map((item) => item.id);
+    }
+    const result = removeEmails(ids);
+    await persistEmails();
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (method === "DELETE" && pathname.startsWith("/api/emails/")) {
     const id = decodeURIComponent(pathname.split("/").pop() || "");
-    const before = emails.length;
-    emails = emails.filter((item) => item.id !== id);
+    const result = removeEmails([id]);
     await persistEmails();
-    sendJson(res, 200, {removed: before - emails.length});
+    sendJson(res, 200, result);
     return;
   }
 

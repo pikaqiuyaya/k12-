@@ -289,6 +289,11 @@ email-----http://mail-api/api/GetLastEmails?email=..."
               <h2 id="email-pool-title">邮箱池列表</h2>
             </div>
             <div class="modal-actions">
+              <button class="danger small" :disabled="!selectedEmailIds.length" @click="deleteSelectedEmails">
+                删除选中 {{ selectedEmailIds.length }}
+              </button>
+              <button class="danger small" :disabled="!summary.emails.failed" @click="deleteEmailsByStatus('failed')">删除失败</button>
+              <button class="danger small" :disabled="!summary.emails.free" @click="deleteEmailsByStatus('free')">删除空闲</button>
               <button class="ghost small" @click="loadEmails">刷新邮箱</button>
               <button class="ghost small" @click="closeEmailPool">关闭</button>
             </div>
@@ -316,6 +321,14 @@ email-----http://mail-api/api/GetLastEmails?email=..."
               <table>
                 <thead>
                   <tr>
+                    <th>
+                      <input
+                        type="checkbox"
+                        :checked="allVisibleEmailsSelected"
+                        :disabled="!deletableEmails.length"
+                        @change="toggleAllEmails"
+                      />
+                    </th>
                     <th>邮箱</th>
                     <th>状态</th>
                     <th>接码</th>
@@ -326,6 +339,14 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                 <tbody>
                   <tr v-for="item in emails" :key="item.id">
                     <td>
+                      <input
+                        type="checkbox"
+                        :checked="selectedEmailIds.includes(item.id)"
+                        :disabled="item.status === 'running'"
+                        @change="toggleEmailSelection(item.id)"
+                      />
+                    </td>
+                    <td>
                       <div class="cell-with-action">
                         <span class="mono clipped">{{ item.email }}</span>
                         <button class="ghost tiny" @click="copyText(item.email, '邮箱已复制')">复制</button>
@@ -334,10 +355,10 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                     <td><span :class="['status', item.status]">{{ statusText(item.status) }}</span></td>
                     <td class="muted clipped">{{ item.mailboxUrlMasked }}</td>
                     <td class="mono clipped">{{ item.sub2apiAccount || "-" }}</td>
-                    <td><button class="danger small" @click="deleteEmail(item.id)">删除</button></td>
+                    <td><button class="danger small" :disabled="item.status === 'running'" @click="deleteEmail(item.id, item.email)">删除</button></td>
                   </tr>
                   <tr v-if="!emails.length">
-                    <td colspan="5" class="empty">还没有邮箱，先在上方导入。</td>
+                    <td colspan="6" class="empty">还没有邮箱，先在上方导入。</td>
                   </tr>
                 </tbody>
               </table>
@@ -461,6 +482,7 @@ const selectedTask = ref<TaskItem | null>(null);
 const emailText = ref("");
 const importResult = ref("");
 const importingEmails = ref(false);
+const selectedEmailIds = ref<string[]>([]);
 const workspaceText = ref("");
 const runCount = ref(1);
 const toast = ref("");
@@ -495,6 +517,8 @@ const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 
 const workspaceCount = computed(() => parseWorkspaceIds(workspaceText.value).length);
 const selectedReadyCount = computed(() => Math.min(Math.max(1, Number(runCount.value) || 1), emails.value.filter((item) => item.status === "free").length));
 const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
+const deletableEmails = computed(() => emails.value.filter((item) => item.status !== "running"));
+const allVisibleEmailsSelected = computed(() => deletableEmails.value.length > 0 && deletableEmails.value.every((item) => selectedEmailIds.value.includes(item.id)));
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
@@ -577,6 +601,8 @@ async function saveConfig() {
 async function loadEmails() {
   const data = await api<any>("/api/emails");
   emails.value = data.items || [];
+  const existingIds = new Set(emails.value.map((item) => item.id));
+  selectedEmailIds.value = selectedEmailIds.value.filter((id) => existingIds.has(id));
 }
 
 function openSettings() {
@@ -602,6 +628,7 @@ async function openEmailPool() {
 
 function closeEmailPool() {
   showEmailPoolModal.value = false;
+  selectedEmailIds.value = [];
 }
 
 async function loadTasks() {
@@ -668,8 +695,49 @@ async function importEmails() {
   }
 }
 
-async function deleteEmail(id: string) {
-  await api(`/api/emails/${encodeURIComponent(id)}`, {method: "DELETE"});
+function toggleEmailSelection(id: string) {
+  selectedEmailIds.value = selectedEmailIds.value.includes(id)
+    ? selectedEmailIds.value.filter((item) => item !== id)
+    : [...selectedEmailIds.value, id];
+}
+
+function toggleAllEmails(event: Event) {
+  const checked = (event.target as HTMLInputElement).checked;
+  selectedEmailIds.value = checked ? deletableEmails.value.map((item) => item.id) : [];
+}
+
+async function deleteEmail(id: string, email = "") {
+  const ok = window.confirm(`确认删除邮箱 ${email || id}？`);
+  if (!ok) return;
+  const result = await api<any>(`/api/emails/${encodeURIComponent(id)}`, {method: "DELETE"});
+  showToast(`删除完成：删除 ${result.removed ?? 0} 个${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
+  selectedEmailIds.value = selectedEmailIds.value.filter((item) => item !== id);
+  await refreshAll();
+}
+
+async function deleteSelectedEmails() {
+  if (!selectedEmailIds.value.length) return;
+  const ok = window.confirm(`确认删除选中的 ${selectedEmailIds.value.length} 个邮箱？运行中的邮箱会跳过。`);
+  if (!ok) return;
+  const result = await api<any>("/api/emails/delete", {
+    method: "POST",
+    body: JSON.stringify({ids: selectedEmailIds.value}),
+  });
+  selectedEmailIds.value = [];
+  showToast(`批量删除完成：删除 ${result.removed ?? 0} 个${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
+  await refreshAll();
+}
+
+async function deleteEmailsByStatus(status: "free" | "failed" | "success") {
+  const label = statusText(status);
+  const ok = window.confirm(`确认删除所有${label}邮箱？`);
+  if (!ok) return;
+  const result = await api<any>("/api/emails/delete", {
+    method: "POST",
+    body: JSON.stringify({status}),
+  });
+  selectedEmailIds.value = [];
+  showToast(`删除${label}邮箱完成：删除 ${result.removed ?? 0} 个`);
   await refreshAll();
 }
 
