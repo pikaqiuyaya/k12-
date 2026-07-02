@@ -179,6 +179,15 @@ function parseStringList(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function uniqueStringList(values: string[]): string[] {
+  return Array.from(new Set(values.map((item) => item.trim()).filter(Boolean)));
+}
+
+function randomItem<T>(items: T[]): T | undefined {
+  if (!items.length) return undefined;
+  return items[Math.floor(Math.random() * items.length)];
+}
+
 function maskSecret(value: string, head = 4, tail = 4): string {
   const text = String(value || "");
   if (!text) return "";
@@ -3033,7 +3042,7 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
     ? emails.filter((item) => requested.has(item.id))
     : emails.filter((item) => item.status === "free");
   const limit = asNumber(body.count, selectedEmails.length || 1, 1, 500);
-  const workspaceIds = parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : appConfig.workspaceIds;
+  const workspaceCandidates = uniqueStringList(parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : appConfig.workspaceIds);
   const route = body.route === "accept" ? "accept" : appConfig.route;
   const runWorkspaceJoin = asBoolean(body.runWorkspaceJoin, appConfig.runWorkspaceJoin);
   const runSub2Api = asBoolean(body.runSub2Api, appConfig.runSub2Api);
@@ -3046,6 +3055,8 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
       skippedRunning += 1;
       continue;
     }
+    const pickedWorkspaceId = randomItem(workspaceCandidates);
+    const taskWorkspaceIds = pickedWorkspaceId ? [pickedWorkspaceId] : [];
     const task: K12Task = {
       id: `k12_${Date.now()}_${randomUUID().slice(0, 8)}`,
       kind: "k12",
@@ -3053,7 +3064,7 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
       email: email.email,
       status: "queued",
       route,
-      workspaceIds,
+      workspaceIds: taskWorkspaceIds,
       runWorkspaceJoin,
       runSub2Api,
       sub2apiGroupName,
@@ -3062,7 +3073,11 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
       workspaceResults: [],
       logs: [],
     };
-    appendLog(task, "info", `已排队: ${email.email}`);
+    appendLog(
+      task,
+      "info",
+      `已排队: ${email.email}${workspaceCandidates.length > 1 && pickedWorkspaceId ? `，随机 workspace=${pickedWorkspaceId}` : ""}`,
+    );
     tasks.push(task);
     email.status = "running";
     email.lastTaskId = task.id;

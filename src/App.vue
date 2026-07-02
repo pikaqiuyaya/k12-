@@ -170,7 +170,7 @@
     <div v-if="toast" class="toast">{{ toast }}</div>
 
     <Teleport to="body">
-      <div v-if="showSettingsModal" class="modal-backdrop" @click.self="closeSettings">
+      <div v-if="showSettingsModal" class="modal-backdrop">
         <section class="panel modal-card settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
           <div class="section-head">
             <div>
@@ -190,7 +190,7 @@
                 <span class="pill">{{ workspaceCount }} 个 workspace</span>
               </div>
               <label class="field">
-                <span>K12 Workspace ID（一行一个或逗号分隔）</span>
+                <span>K12 Workspace ID（一行一个或逗号分隔；多个时每个邮箱随机选一个）</span>
                 <textarea v-model="workspaceText" class="workspace-box"></textarea>
               </label>
               <div class="switch-grid">
@@ -198,7 +198,7 @@
                   <input v-model="form.runWorkspaceJoin" type="checkbox" />
                   <span>
                     <strong>执行 K12 空间脚本</strong>
-                    <small>使用获取到的 AT 调用 workspace request/accept。</small>
+                    <small>多个 workspace 时，每个邮箱任务会随机抽取其中一个执行 request/accept。</small>
                   </span>
                 </label>
                 <label class="switch-card">
