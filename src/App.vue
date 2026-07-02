@@ -41,6 +41,16 @@
         <strong>{{ workspaceCount }}</strong>
         <small>{{ form.route === "accept" ? "Accept" : "Request" }} 模式</small>
       </article>
+      <article class="stat-card refill-card">
+        <span>自动补号</span>
+        <strong>{{ sub2apiRefillStatus.lastResult?.normalAccounts ?? "-" }}</strong>
+        <small>{{ refillSummaryText }}</small>
+      </article>
+      <article class="stat-card smsbower-card">
+        <span>SMSBower</span>
+        <strong>{{ smsBowerBalanceText }}</strong>
+        <small>{{ smsBowerSpendText }}</small>
+      </article>
     </section>
 
     <section class="panel task-panel">
@@ -60,6 +70,12 @@
           <button class="ghost" :disabled="checkingTasks" @click="loadInactiveTaskData">
             一键失活数据
           </button>
+          <button class="ghost" :disabled="startingSub2apiRefill || sub2apiRefillStatus.running" @click="startSub2apiRefill">
+            {{ startingSub2apiRefill || sub2apiRefillStatus.running ? "补号检测中..." : "启动补号" }}
+          </button>
+          <button class="ghost" @click="openSub2apiRefillHistory">
+            补号日志
+          </button>
           <button class="ghost" :disabled="!inactiveMarkedTasks.length" @click="selectInactiveMarkedTasks">
             勾选失活 {{ inactiveMarkedTasks.length }}
           </button>
@@ -72,9 +88,12 @@
           </label>
           <button class="ghost" @click="openEmailImport">邮箱导入</button>
           <button class="ghost" @click="openEmailPool">邮箱池</button>
-          <button class="primary" :disabled="!selectedReadyCount || busy" @click="startTasks">
-            {{ busy ? "运行中" : `启动 ${selectedReadyCount} 个任务` }}
+          <button class="primary" :disabled="startTasksDisabled" @click="startTasks">
+            {{ busy ? "运行中" : `启动 ${launchTaskCount} 个任务` }}
           </button>
+          <span v-if="form.smsBowerMailEnabled" class="launch-mode-badge">
+            SMSBower Gmail 动态模式，不占用邮箱池；开启裂变时，启动数量为母邮箱数
+          </span>
         </div>
       </div>
 
@@ -265,8 +284,13 @@
                   <input v-model="form.sub2apiPassword" type="password" :placeholder="passwordPlaceholder" />
                 </label>
                 <label class="field">
-                  <span>分组</span>
-                  <input v-model="form.sub2apiGroupName" placeholder="k12" />
+                  <span>分组（可多个）</span>
+                  <input v-model="form.sub2apiGroupName" placeholder="k12, shared-group" />
+                  <small>多个分组用逗号、分号或换行分隔；账号会同时绑定这些分组。</small>
+                </label>
+                <label class="field">
+                  <span>IP管理 / 代理</span>
+                  <input v-model="form.sub2apiProxyName" placeholder="留空不绑定；可填 Sub2API 代理名称或 ID" />
                 </label>
                 <label class="field">
                   <span>Token 输出文件</span>
@@ -285,6 +309,113 @@
                 </label>
               </div>
             </section>
+
+            <section class="settings-section">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="eyebrow">Auto Refill</p>
+                  <h3>Sub2API 自动补号</h3>
+                </div>
+                <span class="pill">{{ form.sub2apiAutoRefillEnabled ? "已启用" : "未启用" }}</span>
+              </div>
+              <label class="switch-card refill-switch">
+                <input v-model="form.sub2apiAutoRefillEnabled" type="checkbox" />
+                <span>
+                  <strong>启动定时检测补号</strong>
+                  <small>定时统计目标分组正常账号数；低于预警线时，从空闲邮箱池自动创建补号任务。</small>
+                </span>
+              </label>
+              <label class="switch-card refill-switch">
+                <input v-model="form.sub2apiRefillDeepCheckEnabled" type="checkbox" />
+                <span>
+                  <strong>开启深度测活</strong>
+                  <small>检测时对账号执行一次真实模型请求；只有真实可用的账号才计入正常账号数。</small>
+                </span>
+              </label>
+              <div class="config-grid refill-config-grid">
+                <label class="field">
+                  <span>检测 Sub2API 补号分组名称</span>
+                  <input v-model="form.sub2apiRefillGroupName" placeholder="k12" />
+                </label>
+                <label class="field">
+                  <span>预警线（正常账号低于多少开始补号）</span>
+                  <input v-model.number="form.sub2apiRefillThreshold" type="number" min="0" />
+                </label>
+                <label class="field">
+                  <span>补号执行的邮箱数量</span>
+                  <input v-model.number="form.sub2apiRefillEmailCount" type="number" min="1" max="500" />
+                </label>
+                <label class="field">
+                  <span>定时检测间隔 ms</span>
+                  <input v-model.number="form.sub2apiRefillIntervalMs" type="number" min="10000" />
+                </label>
+              </div>
+              <p class="hint">
+                补号任务会复用当前 K12 / Sub2API 入库配置；实际执行并发按照上方“并发”设置。
+                {{ sub2apiRefillStatus.nextCheckAt ? `下次检测：${fmtDateTime(sub2apiRefillStatus.nextCheckAt)}` : "" }}
+              </p>
+            </section>
+
+            <section class="settings-section">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="eyebrow">SMSBower Gmail</p>
+                  <h3>动态谷歌邮箱接码</h3>
+                </div>
+                <span class="pill">{{ form.smsBowerMailEnabled ? "已启用" : "未启用" }}</span>
+              </div>
+              <label class="switch-card refill-switch">
+                <input v-model="form.smsBowerMailEnabled" type="checkbox" />
+                <span>
+                  <strong>使用 SMSBower 谷歌邮箱</strong>
+                  <small>开启后，未指定邮箱启动任务时动态租 Gmail 接码；关闭时仍按原来的邮箱池流程执行。</small>
+                </span>
+              </label>
+              <p v-if="smsBowerBackendUnsupported" class="inline-alert warn">
+                当前后端未返回 SMSBower 配置字段，说明服务仍在跑旧进程。请重启后端后再保存，否则开关会被旧接口丢弃。
+              </p>
+              <label class="switch-card refill-switch">
+                <input v-model="form.smsBowerGmailFissionEnabled" type="checkbox" />
+                <span>
+                  <strong>开启谷歌裂变</strong>
+                  <small>母邮箱任务成功后，再逐个创建 +alias 子邮箱任务，避免验证码串号。</small>
+                </span>
+              </label>
+              <div class="config-grid refill-config-grid">
+                <label class="field">
+                  <span class="field-title-row">
+                    SMSBower API Key
+                    <em :class="['key-state', smsBowerApiKeySaved ? 'set' : 'unset']">
+                      {{ smsBowerApiKeySaved ? "已设置 Key" : "未设置 Key" }}
+                    </em>
+                  </span>
+                  <input v-model="form.smsBowerApiKey" type="password" :placeholder="smsBowerApiKeyPlaceholder" />
+                  <small v-if="smsBowerApiKeySaved">已保存的 Key：{{ smsBowerApiKeyMasked || "已隐藏" }}，留空保存不会覆盖。</small>
+                  <small v-else>还没有保存 Key，填写后点击“保存配置”才会生效。</small>
+                </label>
+                <label class="field">
+                  <span>Mail API 地址</span>
+                  <input v-model="form.smsBowerMailBaseUrl" placeholder="https://smsbower.page/api/mail" />
+                </label>
+                <label class="field">
+                  <span>服务代码</span>
+                  <input v-model="form.smsBowerMailService" placeholder="openai" />
+                  <small>可填 openai；后端会自动按 SMSBower 邮件服务码 dr 请求。</small>
+                </label>
+                <label class="field">
+                  <span>邮箱域名</span>
+                  <input v-model="form.smsBowerMailDomain" placeholder="gmail.com" />
+                </label>
+                <label class="field">
+                  <span>最高价格（可空）</span>
+                  <input v-model="form.smsBowerMailMaxPrice" placeholder="留空不限制" />
+                </label>
+                <label class="field">
+                  <span>每个母邮箱裂变子任务数</span>
+                  <input v-model.number="form.smsBowerGmailFissionCount" type="number" min="1" max="100" />
+                </label>
+              </div>
+            </section>
           </div>
 
           <div class="modal-footer">
@@ -292,6 +423,76 @@
             <button class="primary" :disabled="savingConfig" @click="saveConfig">
               {{ savingConfig ? "保存中..." : "保存配置" }}
             </button>
+          </div>
+        </section>
+      </div>
+
+      <div v-if="showSub2apiRefillHistoryModal" class="modal-backdrop" @click.self="closeSub2apiRefillHistory">
+        <section class="panel modal-card refill-history-modal" role="dialog" aria-modal="true" aria-labelledby="refill-history-title">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Refill History</p>
+              <h2 id="refill-history-title">补号日志 / 历史记录</h2>
+            </div>
+            <div class="modal-actions">
+              <button class="ghost small" @click="loadSub2apiRefillHistory">刷新</button>
+              <button class="ghost small" @click="closeSub2apiRefillHistory">关闭</button>
+            </div>
+          </div>
+          <div class="modal-body">
+            <div class="modal-status-grid refill-history-summary">
+              <div>
+                <span>最近状态</span>
+                <strong>{{ sub2apiRefillStatus.lastError ? "失败" : sub2apiRefillStatus.lastResult ? "完成" : "无记录" }}</strong>
+              </div>
+              <div>
+                <span>最近正常数</span>
+                <strong>{{ sub2apiRefillStatus.lastResult?.normalAccounts ?? "-" }}</strong>
+              </div>
+              <div>
+                <span>下次检测</span>
+                <strong>{{ sub2apiRefillStatus.nextCheckAt ? fmtDateTime(sub2apiRefillStatus.nextCheckAt) : "-" }}</strong>
+              </div>
+            </div>
+            <div class="table-wrap refill-history-table-wrap">
+              <table class="task-table refill-history-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>来源</th>
+                    <th>结果</th>
+                    <th>分组</th>
+                    <th>正常/预警</th>
+                    <th>深度测活</th>
+                    <th>创建任务</th>
+                    <th>原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in sub2apiRefillHistory" :key="item.id">
+                    <td>{{ fmtDateTime(item.checkedAt) }}</td>
+                    <td>{{ item.source === "timer" ? "定时" : item.source === "manual" ? "手动" : "-" }}</td>
+                    <td><span :class="['status', item.ok ? 'success' : 'failed']">{{ item.ok ? "成功" : "失败" }}</span></td>
+                    <td>{{ item.groupName || "-" }}</td>
+                    <td>{{ item.normalAccounts ?? "-" }}/{{ item.threshold ?? "-" }}</td>
+                    <td>
+                      <span v-if="item.deepCheckEnabled">开启 {{ item.deepOk ?? 0 }}/{{ item.deepChecked ?? 0 }}</span>
+                      <span v-else>关闭</span>
+                    </td>
+                    <td>{{ item.createdTasks ?? 0 }}</td>
+                    <td>
+                      <div class="history-message">
+                        <span>{{ item.message || item.error || "-" }}</span>
+                        <small v-if="item.samples?.length">{{ item.samples.slice(0, 3).join("；") }}</small>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr v-if="!sub2apiRefillHistory.length">
+                    <td colspan="8" class="empty">暂无补号检测记录。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </section>
       </div>
@@ -309,29 +510,61 @@
             </div>
           </div>
           <div class="modal-body import-body">
-            <label class="field">
-              <span>选择邮箱文件（txt）</span>
-              <input type="file" accept=".txt,text/plain" @change="loadEmailImportFile" />
+            <div class="mode-toggle">
+              <label :class="['mode-card', {active: emailImportMode === 'auto'}]">
+                <input v-model="emailImportMode" type="radio" value="auto" />
+                <span class="mode-content">
+                  <span class="mode-title-row">
+                    <strong>自动接码</strong>
+                    <em>推荐</em>
+                  </span>
+                  <small>需要邮箱行包含接码 URL 或 clientId/refreshToken，适合批量自动跑。</small>
+                </span>
+              </label>
+              <label :class="['mode-card', {active: emailImportMode === 'manual'}]">
+                <input v-model="emailImportMode" type="radio" value="manual" />
+                <span class="mode-content">
+                  <span class="mode-title-row">
+                    <strong>手动接码</strong>
+                    <em>备用</em>
+                  </span>
+                  <small>只导入邮箱；任务需要验证码时，在任务日志里手动填写。</small>
+                </span>
+              </label>
+            </div>
+            <label class="import-file-card">
+              <input class="visually-hidden-file" type="file" accept=".txt,text/plain" @change="loadEmailImportFile" />
+              <span class="file-icon">TXT</span>
+              <span class="file-copy">
+                <strong>{{ emailImportFileName || "选择邮箱文件" }}</strong>
+                <small>支持 .txt 文件，也可以直接在下方粘贴邮箱内容</small>
+              </span>
+              <span class="file-action">浏览</span>
             </label>
-            <textarea
-              v-model="emailText"
-              placeholder="支持：
-email----password----clientId----refreshToken
-email-----http://mail-api/api/GetLastEmails?email=..."
-            ></textarea>
-            <div class="row spread">
-              <label class="field inline">
+            <label class="field import-text-field">
+              <span>邮箱内容</span>
+              <textarea
+                v-model="emailText"
+                :placeholder="emailImportPlaceholder"
+              ></textarea>
+            </label>
+            <div class="import-footer-row">
+              <label v-if="emailImportMode === 'auto'" class="field import-api-field">
                 <span>接码 API 域名</span>
                 <input v-model="form.mailApiBaseUrl" placeholder="http://wremail.cc/" />
               </label>
-              <div class="row-actions">
-                <button class="ghost" :disabled="importingEmails" @click="emailText = ''; importResult = ''">清空</button>
+              <p v-else class="hint manual-import-hint">
+                手动接码模式下每行只要有邮箱即可，例如：
+                <code>user@example.com</code>
+              </p>
+              <div class="row-actions import-actions">
+                <button class="ghost" :disabled="importingEmails" @click="clearEmailImport">清空</button>
                 <button class="primary" :disabled="!emailText.trim() || importingEmails" @click="importEmails">
                   {{ importingEmails ? "导入中..." : "导入邮箱" }}
                 </button>
               </div>
             </div>
-            <pre v-if="importResult">{{ importResult }}</pre>
+            <pre v-if="importResult" class="import-result">{{ importResult }}</pre>
           </div>
         </section>
       </div>
@@ -367,6 +600,9 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                 删除选中 {{ selectedEmailIds.length }}
               </button>
               <button class="danger small" :disabled="!summary.emails.failed" @click="deleteEmailsByStatus('failed')">删除失败</button>
+              <button class="danger small" :disabled="!freeChildEmails.length" @click="deleteFreeChildEmails">
+                删除空闲子邮箱 {{ freeChildEmails.length }}
+              </button>
               <button class="danger small" :disabled="!summary.emails.free" @click="deleteEmailsByStatus('free')">删除空闲</button>
               <button class="danger small" :disabled="!summary.emails.banned" @click="deleteEmailsByStatus('banned')">删除GPT封号</button>
               <button class="ghost small" @click="loadEmails">刷新邮箱</button>
@@ -394,6 +630,14 @@ email-----http://mail-api/api/GetLastEmails?email=..."
               <div>
                 <span>GPT封号</span>
                 <strong>{{ summary.emails.banned }}</strong>
+              </div>
+              <div>
+                <span>子邮箱</span>
+                <strong>{{ childEmails.length }}</strong>
+              </div>
+              <div>
+                <span>封号子邮箱</span>
+                <strong>{{ bannedChildEmails.length }}</strong>
               </div>
             </div>
             <pre v-if="accessTokenCheckResult" class="check-result">{{ accessTokenCheckResult }}</pre>
@@ -431,10 +675,20 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                         <span class="mono clipped">{{ item.email }}</span>
                         <button class="ghost tiny" @click="copyText(item.email, '邮箱已复制')">复制</button>
                       </div>
-                      <small v-if="item.parentEmail" class="muted">母邮箱：{{ item.parentEmail }}</small>
+                      <div v-if="item.parentEmail" class="email-meta-row">
+                        <span :class="['child-badge', item.status === 'banned' ? 'banned' : '']">
+                          {{ item.status === "banned" ? "子邮箱 · GPT封号" : "子邮箱" }}
+                        </span>
+                        <small class="muted">母邮箱：{{ item.parentEmail }}</small>
+                      </div>
                     </td>
                     <td><span :class="['status', item.status]">{{ statusText(item.status) }}</span></td>
-                    <td class="muted clipped">{{ item.mailboxUrlMasked }}</td>
+                    <td>
+                      <span :class="['otp-mode-badge', item.otpMode === 'manual' ? 'manual' : 'auto']">
+                        {{ item.otpMode === "manual" ? "手动接码" : "自动接码" }}
+                      </span>
+                      <small class="muted clipped">{{ item.mailboxUrlMasked }}</small>
+                    </td>
                     <td class="mono clipped">{{ item.sub2apiAccount || "-" }}</td>
                     <td><button class="danger small" :disabled="item.status === 'running'" @click="deleteEmail(item.id, item.email)">删除</button></td>
                   </tr>
@@ -515,6 +769,29 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                 <strong>{{ selectedTask.workspaceResults.filter((r) => r.ok).length }}/{{ selectedTask.workspaceIds.length }}</strong>
               </div>
             </div>
+            <div v-if="selectedTask.waitingOtp" class="manual-otp-panel">
+              <div>
+                <p class="eyebrow">Manual OTP</p>
+                <h3>等待手动输入验证码</h3>
+                <p class="hint">
+                  {{ selectedTask.waitingOtpLabel || "邮箱" }}验证码已发送到
+                  <strong>{{ selectedTask.waitingOtpEmail || selectedTask.email }}</strong>
+                </p>
+              </div>
+              <div class="manual-otp-actions">
+                <input
+                  v-model="manualOtpCode"
+                  class="manual-otp-input"
+                  inputmode="numeric"
+                  maxlength="6"
+                  placeholder="6位验证码"
+                  @keyup.enter="submitManualOtp"
+                />
+                <button class="primary" :disabled="manualOtpCode.trim().length !== 6 || submittingOtp" @click="submitManualOtp">
+                  {{ submittingOtp ? "提交中..." : "提交验证码" }}
+                </button>
+              </div>
+            </div>
             <ol class="logs">
               <li v-for="(log, index) in selectedTask.logs" :key="index" :class="log.level">
                 <time>{{ fmtTime(log.at) }}</time>
@@ -538,6 +815,7 @@ interface EmailItem {
   id: string;
   email: string;
   parentEmail?: string;
+  otpMode?: string;
   status: string;
   mailboxUrlMasked: string;
   sub2apiAccount?: string;
@@ -558,6 +836,10 @@ interface TaskItem {
   sub2apiAccount?: string;
   jsonOutFile?: string;
   jsonOutFormat?: string;
+  waitingOtp?: boolean;
+  waitingOtpLabel?: string;
+  waitingOtpEmail?: string;
+  waitingOtpSince?: string;
   workspaceIds: string[];
   workspaceResults: Array<{ok: boolean}>;
   logs: Array<{at: string; level: string; message: string}>;
@@ -574,17 +856,79 @@ interface AccessTokenCheckItem {
   latencyMs: number;
 }
 
+interface Sub2ApiRefillResult {
+  id?: string;
+  checkedAt: string;
+  source?: "manual" | "timer";
+  ok?: boolean;
+  groupName: string;
+  groupLabel: string;
+  threshold: number;
+  refillEmailCount: number;
+  deepCheckEnabled?: boolean;
+  basicNormalAccounts?: number;
+  normalAccounts: number;
+  deepChecked?: number;
+  deepOk?: number;
+  deepFailed?: number;
+  pendingTasks: number;
+  availableEmails: number;
+  createdTasks: number;
+  shouldRefill: boolean;
+  message: string;
+  error?: string;
+  samples?: string[];
+}
+
+interface Sub2ApiRefillStatus {
+  enabled: boolean;
+  running: boolean;
+  nextCheckAt: string;
+  lastCheckedAt: string;
+  lastError: string;
+  lastResult: Sub2ApiRefillResult | null;
+  history?: Sub2ApiRefillResult[];
+}
+
+interface SmsBowerAccountStatus {
+  enabled: boolean;
+  apiKeyPresent: boolean;
+  apiKeyMasked: string;
+  ok: boolean;
+  balance?: number;
+  currency: string;
+  localSpend: number;
+  rentedCount: number;
+  closedCount: number;
+  fetchedAt: string;
+  error?: string;
+}
+
 const defaultSummary = {
   emails: {total: 0, free: 0, running: 0, success: 0, failed: 0, banned: 0},
   tasks: {total: 0, queued: 0, running: 0, success: 0, failed: 0, canceled: 0},
 };
 
 const summary = reactive(JSON.parse(JSON.stringify(defaultSummary)));
+const sub2apiRefillStatus = reactive<Sub2ApiRefillStatus>({
+  enabled: false,
+  running: false,
+  nextCheckAt: "",
+  lastCheckedAt: "",
+  lastError: "",
+  lastResult: null,
+  history: [],
+});
+const sub2apiRefillHistory = ref<Sub2ApiRefillResult[]>([]);
 const emails = ref<EmailItem[]>([]);
 const tasks = ref<TaskItem[]>([]);
 const selectedTask = ref<TaskItem | null>(null);
 const emailText = ref("");
+const emailImportMode = ref<"auto" | "manual">("auto");
+const emailImportFileName = ref("");
 const importResult = ref("");
+const manualOtpCode = ref("");
+const submittingOtp = ref(false);
 const importingEmails = ref(false);
 const checkingAccessTokens = ref(false);
 const checkingTasks = ref(false);
@@ -600,11 +944,28 @@ const runCount = ref(1);
 const toast = ref("");
 const savingConfig = ref(false);
 const importingData = ref(false);
+const startingSub2apiRefill = ref(false);
+const smsBowerApiKeySaved = ref(false);
+const smsBowerApiKeyMasked = ref("");
+const smsBowerBackendUnsupported = ref(false);
+const smsBowerAccount = reactive<SmsBowerAccountStatus>({
+  enabled: false,
+  apiKeyPresent: false,
+  apiKeyMasked: "",
+  ok: false,
+  currency: "USD",
+  localSpend: 0,
+  rentedCount: 0,
+  closedCount: 0,
+  fetchedAt: "",
+});
 const showSettingsModal = ref(false);
 const showEmailImportModal = ref(false);
 const showEmailPoolModal = ref(false);
 const showTaskLogModal = ref(false);
+const showSub2apiRefillHistoryModal = ref(false);
 let timer: number | undefined;
+let smsBowerAccountTimer: number | undefined;
 
 const form = reactive({
   defaultPassword: "",
@@ -624,6 +985,20 @@ const form = reactive({
   sub2apiProxyName: "",
   sub2apiAccountPriority: 1,
   sub2apiConcurrency: 10,
+  sub2apiAutoRefillEnabled: false,
+  sub2apiRefillGroupName: "k12",
+  sub2apiRefillThreshold: 5,
+  sub2apiRefillEmailCount: 5,
+  sub2apiRefillIntervalMs: 300000,
+  sub2apiRefillDeepCheckEnabled: false,
+  smsBowerMailEnabled: false,
+  smsBowerApiKey: "",
+  smsBowerMailBaseUrl: "https://smsbower.page/api/mail",
+  smsBowerMailService: "openai",
+  smsBowerMailDomain: "gmail.com",
+  smsBowerMailMaxPrice: "",
+  smsBowerGmailFissionEnabled: false,
+  smsBowerGmailFissionCount: 1,
   tokenOut: "",
   jsonOutDir: "",
   jsonOutFormat: "sub2api",
@@ -631,7 +1006,11 @@ const form = reactive({
 
 const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 0);
 const workspaceCount = computed(() => parseWorkspaceIds(workspaceText.value).length);
-const selectedReadyCount = computed(() => Math.min(Math.max(1, Number(runCount.value) || 1), emails.value.filter((item) => item.status === "free").length));
+const launchTaskCount = computed(() => {
+  const count = Math.max(1, Number(runCount.value) || 1);
+  return form.smsBowerMailEnabled ? count : Math.min(count, emails.value.filter((item) => item.status === "free").length);
+});
+const startTasksDisabled = computed(() => busy.value || (!form.smsBowerMailEnabled && launchTaskCount.value <= 0));
 const selectedRunnableEmailIds = computed(() => emails.value
   .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
   .map((item) => item.id));
@@ -646,8 +1025,35 @@ const allCheckableTasksSelected = computed(() => checkableTasks.value.length > 0
 const inactiveMarkedTasks = computed(() => tasks.value.filter((item) => item.accessTokenLiveness === "inactive" || item.accessTokenLiveness === "banned"));
 const selectableParentEmails = computed(() => emails.value.filter((item) => !item.parentEmail && item.status !== "running"));
 const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
+const smsBowerApiKeyPlaceholder = computed(() => form.smsBowerApiKey || smsBowerApiKeySaved.value ? "已设置 Key，留空则不修改" : "填写 SMSBower API Key");
+const smsBowerBalanceText = computed(() => {
+  if (!form.smsBowerMailEnabled) return "未启用";
+  if (!smsBowerAccount.apiKeyPresent) return "未设置Key";
+  if (smsBowerAccount.ok && smsBowerAccount.balance !== undefined) return `${formatMoney(smsBowerAccount.balance)} ${smsBowerAccount.currency || "USD"}`;
+  return "获取失败";
+});
+const smsBowerSpendText = computed(() => {
+  if (!form.smsBowerMailEnabled) return "动态 Gmail 未启用";
+  if (!smsBowerAccount.apiKeyPresent) return "设置页填写 Key 后显示余额";
+  const base = `本地花费 ${formatMoney(smsBowerAccount.localSpend)} / 租号 ${smsBowerAccount.rentedCount}`;
+  if (!smsBowerAccount.ok && smsBowerAccount.error) return `${base}，${smsBowerAccount.error}`;
+  return base;
+});
 const deletableEmails = computed(() => emails.value.filter((item) => item.status !== "running"));
+const childEmails = computed(() => emails.value.filter((item) => Boolean(item.parentEmail)));
+const bannedChildEmails = computed(() => childEmails.value.filter((item) => item.status === "banned"));
+const freeChildEmails = computed(() => emails.value.filter((item) => Boolean(item.parentEmail) && item.status === "free"));
 const allVisibleEmailsSelected = computed(() => deletableEmails.value.length > 0 && deletableEmails.value.every((item) => selectedEmailIds.value.includes(item.id)));
+const refillSummaryText = computed(() => {
+  const result = sub2apiRefillStatus.lastResult;
+  if (sub2apiRefillStatus.running) return "检测中";
+  if (sub2apiRefillStatus.lastError) return `错误：${sub2apiRefillStatus.lastError}`;
+  if (!result) return sub2apiRefillStatus.enabled ? "等待首次检测" : "未启用";
+  return `${result.groupName} / 预警 ${result.threshold} / 已补 ${result.createdTasks}`;
+});
+const emailImportPlaceholder = computed(() => emailImportMode.value === "manual"
+  ? "手动接码模式：\nuser1@example.com\nuser2@example.com"
+  : "支持：\nemail----password----clientId----refreshToken\nemail-----http://mail-api/api/GetLastEmails?email=...");
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
@@ -680,11 +1086,20 @@ async function loadSummary() {
   const data = await api<any>("/api/summary");
   Object.assign(summary.emails, data.emails || defaultSummary.emails);
   Object.assign(summary.tasks, data.tasks || defaultSummary.tasks);
+  Object.assign(sub2apiRefillStatus, {
+    ...sub2apiRefillStatus,
+    ...(data.sub2apiRefill || {}),
+    lastResult: data.sub2apiRefill?.lastResult || null,
+  });
+  if (Array.isArray(data.sub2apiRefill?.history)) {
+    sub2apiRefillHistory.value = data.sub2apiRefill.history;
+  }
 }
 
 async function loadConfig() {
   const data = await api<any>("/api/config");
   const config = data.config || {};
+  smsBowerBackendUnsupported.value = !("smsBowerMailEnabled" in config);
   Object.assign(form, {
     defaultProxyUrl: config.defaultProxyUrl || "",
     mailApiBaseUrl: config.mailApiBaseUrl || "",
@@ -702,25 +1117,69 @@ async function loadConfig() {
     sub2apiProxyName: config.sub2apiProxyName || "",
     sub2apiAccountPriority: config.sub2apiAccountPriority || 1,
     sub2apiConcurrency: config.sub2apiConcurrency || 10,
+    sub2apiAutoRefillEnabled: config.sub2apiAutoRefillEnabled === true,
+    sub2apiRefillGroupName: config.sub2apiRefillGroupName || config.sub2apiGroupName || "k12",
+    sub2apiRefillThreshold: config.sub2apiRefillThreshold ?? 5,
+    sub2apiRefillEmailCount: config.sub2apiRefillEmailCount ?? 5,
+    sub2apiRefillIntervalMs: config.sub2apiRefillIntervalMs ?? 300000,
+    sub2apiRefillDeepCheckEnabled: config.sub2apiRefillDeepCheckEnabled === true,
+    smsBowerMailEnabled: config.smsBowerMailEnabled === true,
+    smsBowerApiKey: "",
+    smsBowerMailBaseUrl: config.smsBowerMailBaseUrl || "https://smsbower.page/api/mail",
+    smsBowerMailService: config.smsBowerMailService || "openai",
+    smsBowerMailDomain: config.smsBowerMailDomain || "gmail.com",
+    smsBowerMailMaxPrice: config.smsBowerMailMaxPrice || "",
+    smsBowerGmailFissionEnabled: config.smsBowerGmailFissionEnabled === true,
+    smsBowerGmailFissionCount: config.smsBowerGmailFissionCount ?? 1,
     tokenOut: config.tokenOut || "",
     jsonOutDir: config.jsonOutDir || "",
     jsonOutFormat: config.jsonOutFormat === "cpa" ? "cpa" : "sub2api",
   });
+  smsBowerApiKeySaved.value = Boolean(config.smsBowerApiKeyPresent);
+  smsBowerApiKeyMasked.value = config.smsBowerApiKeyMasked || "";
   workspaceText.value = (config.workspaceIds || []).join("\n");
+}
+
+async function loadSmsBowerAccount() {
+  const data = await api<SmsBowerAccountStatus>("/api/smsbower/account");
+  Object.assign(smsBowerAccount, {
+    enabled: data.enabled === true,
+    apiKeyPresent: data.apiKeyPresent === true,
+    apiKeyMasked: data.apiKeyMasked || "",
+    ok: data.ok === true,
+    balance: data.balance,
+    currency: data.currency || "USD",
+    localSpend: Number(data.localSpend || 0),
+    rentedCount: Number(data.rentedCount || 0),
+    closedCount: Number(data.closedCount || 0),
+    fetchedAt: data.fetchedAt || "",
+    error: data.error || "",
+  });
+  smsBowerApiKeySaved.value = data.apiKeyPresent === true;
+  smsBowerApiKeyMasked.value = data.apiKeyMasked || smsBowerApiKeyMasked.value;
 }
 
 async function saveConfig() {
   if (savingConfig.value) return false;
   savingConfig.value = true;
   try {
+    const requestedSmsBowerEnabled = form.smsBowerMailEnabled === true;
     const payload = {
       ...form,
       workspaceIds: parseWorkspaceIds(workspaceText.value),
     };
-    await api("/api/config", {method: "PATCH", body: JSON.stringify(payload)});
-    await Promise.all([loadConfig(), loadSummary()]);
+    const saved = await api<any>("/api/config", {method: "PATCH", body: JSON.stringify(payload)});
+    const savedConfig = saved.config || {};
+    if (requestedSmsBowerEnabled && !("smsBowerMailEnabled" in savedConfig)) {
+      smsBowerBackendUnsupported.value = true;
+      throw new Error("当前后端仍是旧版本，未识别 SMSBower 配置字段。请重启服务后再保存。");
+    }
+    await Promise.all([loadConfig(), loadSummary(), loadSmsBowerAccount()]);
+    if (requestedSmsBowerEnabled && !form.smsBowerMailEnabled) {
+      throw new Error("SMSBower Gmail 开关未保存成功，请重启后端后重试。");
+    }
     showSettingsModal.value = false;
-    showToast("配置已保存");
+    showToast(`配置已保存${form.smsBowerMailEnabled ? "：SMSBower Gmail 已启用" : ""}`);
     return true;
   } catch (error) {
     showToast(`保存配置失败：${error instanceof Error ? error.message : String(error)}`);
@@ -763,6 +1222,20 @@ function closeEmailPool() {
   selectedEmailIds.value = [];
 }
 
+async function loadSub2apiRefillHistory() {
+  const data = await api<any>("/api/sub2api/refill/history?limit=100");
+  sub2apiRefillHistory.value = data.items || [];
+}
+
+async function openSub2apiRefillHistory() {
+  showSub2apiRefillHistoryModal.value = true;
+  await Promise.all([loadSummary(), loadSub2apiRefillHistory()]);
+}
+
+function closeSub2apiRefillHistory() {
+  showSub2apiRefillHistoryModal.value = false;
+}
+
 async function loadTasks() {
   const data = await api<any>("/api/tasks");
   tasks.value = data.items || [];
@@ -777,6 +1250,19 @@ async function loadTasks() {
 
 async function refreshAll() {
   await Promise.all([loadSummary(), loadEmails(), loadTasks()]);
+}
+
+async function refreshSmsBowerAccountQuietly() {
+  try {
+    await loadSmsBowerAccount();
+  } catch {
+    Object.assign(smsBowerAccount, {
+      ...smsBowerAccount,
+      ok: false,
+      error: "余额接口请求失败",
+      fetchedAt: new Date().toISOString(),
+    });
+  }
 }
 
 async function exportData() {
@@ -843,6 +1329,7 @@ async function loadEmailImportFile(event: Event) {
   if (!file) return;
   try {
     emailText.value = await file.text();
+    emailImportFileName.value = file.name;
     importResult.value = "";
     const lineCount = emailText.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
     showToast(`已读取文件：${file.name}，${lineCount} 行`);
@@ -851,6 +1338,12 @@ async function loadEmailImportFile(event: Event) {
   } finally {
     input.value = "";
   }
+}
+
+function clearEmailImport() {
+  emailText.value = "";
+  emailImportFileName.value = "";
+  importResult.value = "";
 }
 
 async function importEmails() {
@@ -865,9 +1358,10 @@ async function importEmails() {
   try {
     const data = await api<any>("/api/emails/import", {
       method: "POST",
-      body: JSON.stringify({text, mailApiBaseUrl: form.mailApiBaseUrl}),
+      body: JSON.stringify({text, mailApiBaseUrl: form.mailApiBaseUrl, otpMode: emailImportMode.value}),
     });
     importResult.value = [
+      `接码模式：${emailImportMode.value === "manual" ? "手动接码" : "自动接码"}`,
       `读取行数：${data.inputLines ?? "-"}`,
       `新增：${data.added ?? 0}`,
       `更新：${data.updated ?? 0}`,
@@ -949,6 +1443,22 @@ async function deleteEmailsByStatus(status: "free" | "failed" | "success" | "ban
   });
   selectedEmailIds.value = [];
   showToast(`删除${label}邮箱完成：删除 ${result.removed ?? 0} 个`);
+  await refreshAll();
+}
+
+async function deleteFreeChildEmails() {
+  const items = freeChildEmails.value;
+  if (!items.length) return;
+  const ok = window.confirm(`确认删除 ${items.length} 个空闲子邮箱？母邮箱、运行中、成功、失败和GPT封号邮箱不会删除。`);
+  if (!ok) return;
+  const ids = items.map((item) => item.id);
+  const result = await api<any>("/api/emails/delete", {
+    method: "POST",
+    body: JSON.stringify({ids}),
+  });
+  const removedIds = new Set(ids);
+  selectedEmailIds.value = selectedEmailIds.value.filter((id) => !removedIds.has(id));
+  showToast(`删除空闲子邮箱完成：删除 ${result.removed ?? 0} 个${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
   await refreshAll();
 }
 
@@ -1050,21 +1560,49 @@ async function repairSelectedAccessTokens() {
 async function startTasks() {
   const saved = await saveConfig();
   if (!saved) return;
-  const data = await api<any>("/api/tasks", {
-    method: "POST",
-    body: JSON.stringify({
-      count: selectedReadyCount.value,
-      concurrency: form.taskConcurrency,
-      workspaceIds: parseWorkspaceIds(workspaceText.value),
-      route: form.route,
-      runWorkspaceJoin: form.runWorkspaceJoin,
-      runSub2Api: form.runSub2Api,
-      sub2apiNoRtMode: form.sub2apiNoRtMode,
-      sub2apiGroupName: form.sub2apiGroupName || "k12",
-    }),
-  });
-  showToast(`已创建 ${data.tasks?.length || 0} 个任务`);
-  await refreshAll();
+  try {
+    const data = await api<any>("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        count: launchTaskCount.value,
+        concurrency: form.taskConcurrency,
+        workspaceIds: parseWorkspaceIds(workspaceText.value),
+        route: form.route,
+        runWorkspaceJoin: form.runWorkspaceJoin,
+        runSub2Api: form.runSub2Api,
+        sub2apiNoRtMode: form.sub2apiNoRtMode,
+        sub2apiGroupName: form.sub2apiGroupName || "k12",
+      }),
+    });
+    showToast(`已创建 ${data.tasks?.length || 0} 个任务`);
+    await Promise.all([refreshAll(), refreshSmsBowerAccountQuietly()]);
+  } catch (error) {
+    showToast(`启动任务失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function startSub2apiRefill() {
+  if (startingSub2apiRefill.value || sub2apiRefillStatus.running) return;
+  const saved = await saveConfig();
+  if (!saved) return;
+  startingSub2apiRefill.value = true;
+  try {
+    const data = await api<any>("/api/sub2api/refill/start", {method: "POST", body: "{}"});
+    Object.assign(sub2apiRefillStatus, {
+      ...(data.status || {}),
+      lastResult: data.status?.lastResult || data.result || null,
+    });
+    if (Array.isArray(data.status?.history)) {
+      sub2apiRefillHistory.value = data.status.history;
+    }
+    showToast(data.result?.message || "补号检测完成");
+    await refreshAll();
+  } catch (error) {
+    showToast(`补号检测失败：${error instanceof Error ? error.message : String(error)}`);
+    await loadSummary();
+  } finally {
+    startingSub2apiRefill.value = false;
+  }
 }
 
 async function cancelTask(id: string) {
@@ -1269,12 +1807,38 @@ async function copyAccessToken(task: TaskItem) {
   await copyText(task.accessTokenPreview || "", "当前只复制了 AT 预览值，刷新后可尝试复制完整 AT");
 }
 
+async function submitManualOtp() {
+  const task = selectedTask.value;
+  if (!task?.waitingOtp || submittingOtp.value) return;
+  const code = manualOtpCode.value.trim();
+  if (!/^\d{6}$/.test(code)) {
+    showToast("请输入 6 位数字验证码");
+    return;
+  }
+  submittingOtp.value = true;
+  try {
+    const data = await api<any>(`/api/tasks/${encodeURIComponent(task.id)}/otp`, {
+      method: "POST",
+      body: JSON.stringify({code}),
+    });
+    manualOtpCode.value = "";
+    if (data.task) selectedTask.value = data.task;
+    showToast("验证码已提交，任务继续执行");
+    await refreshAll();
+  } catch (error) {
+    showToast(`提交验证码失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    submittingOtp.value = false;
+  }
+}
+
 function selectTask(task: TaskItem) {
   selectedTask.value = task;
 }
 
 function openTaskLog(task: TaskItem) {
   selectedTask.value = task;
+  manualOtpCode.value = "";
   showTaskLogModal.value = true;
 }
 
@@ -1283,10 +1847,15 @@ function closeTaskLog() {
 }
 
 function sampleEmails() {
-  emailText.value = [
-    "user1@example.com----password----client-id----refresh-token",
-    "user2@example.com-----http://wremail.cc/api/GetLastEmails?email=user2@example.com&clientId=xxx&refreshToken=yyy&num=2&boxType=1",
-  ].join("\n");
+  emailText.value = emailImportMode.value === "manual"
+    ? [
+      "user1@example.com",
+      "user2@example.com",
+    ].join("\n")
+    : [
+      "user1@example.com----password----client-id----refresh-token",
+      "user2@example.com-----http://wremail.cc/api/GetLastEmails?email=user2@example.com&clientId=xxx&refreshToken=yyy&num=2&boxType=1",
+    ].join("\n");
 }
 
 function statusText(status: string) {
@@ -1307,13 +1876,27 @@ function fmtTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
 }
 
+function fmtDateTime(value: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatMoney(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return number.toFixed(3).replace(/\.?0+$/g, "");
+}
+
 onMounted(async () => {
   await loadConfig();
-  await refreshAll();
+  await Promise.all([refreshAll(), refreshSmsBowerAccountQuietly()]);
   timer = window.setInterval(refreshAll, 2500);
+  smsBowerAccountTimer = window.setInterval(refreshSmsBowerAccountQuietly, 60000);
 });
 
 onUnmounted(() => {
   if (timer) window.clearInterval(timer);
+  if (smsBowerAccountTimer) window.clearInterval(smsBowerAccountTimer);
 });
 </script>

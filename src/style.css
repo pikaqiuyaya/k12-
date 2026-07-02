@@ -355,7 +355,7 @@ button.big {
 
 .overview-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 14px;
   margin: 16px 0;
 }
@@ -370,6 +370,20 @@ button.big {
   border-color: rgba(34, 211, 238, 0.35);
   background:
     radial-gradient(circle at top right, rgba(34, 211, 238, 0.18), transparent 48%),
+    var(--surface);
+}
+
+.refill-card {
+  border-color: rgba(168, 85, 247, 0.35);
+  background:
+    radial-gradient(circle at top right, rgba(168, 85, 247, 0.16), transparent 48%),
+    var(--surface);
+}
+
+.smsbower-card {
+  border-color: rgba(52, 211, 153, 0.35);
+  background:
+    radial-gradient(circle at top right, rgba(52, 211, 153, 0.16), transparent 48%),
     var(--surface);
 }
 
@@ -474,6 +488,41 @@ input[type="checkbox"] {
   font-weight: 900;
 }
 
+.field > small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.field-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.key-state {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.key-state.set {
+  color: #bbf7d0;
+  border-color: rgba(52, 211, 153, 0.34);
+  background: rgba(52, 211, 153, 0.12);
+}
+
+.key-state.unset {
+  color: #fde68a;
+  border-color: rgba(251, 191, 36, 0.32);
+  background: rgba(251, 191, 36, 0.1);
+}
+
 .field.inline {
   flex: 1;
 }
@@ -494,6 +543,85 @@ input[type="checkbox"] {
 .switch-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   margin: 14px 0;
+}
+
+.mode-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.mode-card {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  padding: 16px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.055), transparent 48%),
+    rgba(15, 23, 42, 0.48);
+  cursor: pointer;
+  transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.mode-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(34, 211, 238, 0.34);
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.08), transparent 50%),
+    rgba(15, 23, 42, 0.58);
+}
+
+.mode-card input[type="radio"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  accent-color: var(--cyan);
+}
+
+.mode-card.active {
+  border-color: rgba(34, 211, 238, 0.68);
+  background:
+    radial-gradient(circle at top right, rgba(34, 211, 238, 0.2), transparent 46%),
+    rgba(8, 47, 73, 0.34);
+  box-shadow: 0 16px 40px rgba(34, 211, 238, 0.11), inset 0 0 0 1px rgba(34, 211, 238, 0.1);
+}
+
+.mode-content {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mode-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mode-card strong {
+  display: block;
+  font-size: 15px;
+}
+
+.mode-card em {
+  border: 1px solid rgba(34, 211, 238, 0.26);
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: #a5f3fc;
+  background: rgba(34, 211, 238, 0.1);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 900;
+}
+
+.mode-card small {
+  color: var(--muted);
+  line-height: 1.55;
 }
 
 .switch-card {
@@ -557,12 +685,48 @@ input[type="checkbox"] {
   flex-wrap: wrap;
 }
 
+.launch-mode-badge {
+  align-self: center;
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  border-radius: 999px;
+  padding: 9px 12px;
+  color: #a5f3fc;
+  background: rgba(34, 211, 238, 0.1);
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
 .hidden-file-input {
   display: none;
 }
 
 .run-count-field {
   width: 150px;
+}
+
+.refill-switch {
+  margin: 12px 0;
+}
+
+.inline-alert {
+  margin: 10px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.inline-alert.warn {
+  color: #fde68a;
+  border-color: rgba(251, 191, 36, 0.32);
+  background: rgba(251, 191, 36, 0.1);
+}
+
+.refill-config-grid .field:last-child,
+.refill-config-grid .field:nth-last-child(2) {
+  grid-column: auto;
 }
 
 .task-table-wrap {
@@ -630,6 +794,92 @@ input[type="checkbox"] {
   color: #fde68a;
   border-color: rgba(251, 191, 36, 0.32);
   background: rgba(251, 191, 36, 0.12);
+}
+
+.email-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.child-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: #a5f3fc;
+  background: rgba(34, 211, 238, 0.1);
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.child-badge.banned {
+  color: #fecdd3;
+  border-color: rgba(251, 113, 133, 0.42);
+  background: rgba(127, 29, 29, 0.28);
+}
+
+.otp-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.otp-mode-badge.auto {
+  color: #bbf7d0;
+  border-color: rgba(52, 211, 153, 0.3);
+  background: rgba(52, 211, 153, 0.1);
+}
+
+.otp-mode-badge.manual {
+  color: #fde68a;
+  border-color: rgba(251, 191, 36, 0.36);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.manual-import-hint {
+  flex: 1;
+  min-width: 280px;
+  margin-top: 0;
+}
+
+.manual-otp-panel {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 14px 0 0;
+  border: 1px solid rgba(251, 191, 36, 0.34);
+  border-radius: 20px;
+  padding: 16px;
+  background:
+    radial-gradient(circle at top left, rgba(251, 191, 36, 0.16), transparent 48%),
+    rgba(15, 23, 42, 0.68);
+}
+
+.manual-otp-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.manual-otp-input {
+  width: 150px;
+  text-align: center;
+  letter-spacing: 0.22em;
+  font-weight: 900;
 }
 
 .row-actions {
@@ -977,11 +1227,15 @@ tbody tr:last-child td {
 }
 
 .import-modal {
-  width: min(900px, calc(100vw - 48px));
+  width: min(940px, calc(100vw - 48px));
 }
 
 .log-modal {
   width: min(1040px, calc(100vw - 48px));
+}
+
+.refill-history-modal {
+  width: min(1280px, calc(100vw - 48px));
 }
 
 .modal-actions {
@@ -1064,11 +1318,140 @@ tbody tr:last-child td {
 
 .import-body {
   display: grid;
-  gap: 14px;
+  gap: 16px;
 }
 
 .import-body textarea {
-  min-height: 260px;
+  min-height: 220px;
+}
+
+.import-file-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border: 1px dashed rgba(148, 163, 184, 0.42);
+  border-radius: 22px;
+  padding: 14px 16px;
+  background:
+    radial-gradient(circle at left, rgba(34, 211, 238, 0.1), transparent 34%),
+    rgba(2, 6, 23, 0.28);
+  cursor: pointer;
+  transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease;
+}
+
+.import-file-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(34, 211, 238, 0.62);
+  background:
+    radial-gradient(circle at left, rgba(34, 211, 238, 0.16), transparent 36%),
+    rgba(2, 6, 23, 0.36);
+}
+
+.visually-hidden-file {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.file-icon {
+  display: inline-flex;
+  flex: 0 0 48px;
+  width: 48px;
+  height: 48px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 16px;
+  color: #a5f3fc;
+  background: rgba(34, 211, 238, 0.1);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.file-copy {
+  display: grid;
+  flex: 1;
+  gap: 4px;
+  min-width: 0;
+}
+
+.file-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-copy small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.file-action {
+  flex: 0 0 auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 8px 14px;
+  color: var(--text);
+  background: rgba(15, 23, 42, 0.72);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.import-text-field {
+  gap: 9px;
+}
+
+.import-text-field textarea {
+  border-radius: 22px;
+  padding: 16px;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.48), rgba(2, 6, 23, 0.5));
+  font-family: "Cascadia Code", Consolas, monospace;
+  line-height: 1.5;
+}
+
+.import-footer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: end;
+}
+
+.import-api-field input {
+  min-height: 46px;
+  font-weight: 800;
+}
+
+.manual-import-hint {
+  align-self: center;
+  line-height: 1.7;
+}
+
+.import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.import-actions button {
+  min-width: 86px;
+}
+
+.import-actions button.primary {
+  min-width: 118px;
+}
+
+.import-result {
+  margin: 0;
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  border-radius: 18px;
+  padding: 14px;
+  color: #c7f9ff;
+  background: rgba(8, 47, 73, 0.24);
 }
 
 .modal-footer {
@@ -1085,6 +1468,51 @@ tbody tr:last-child td {
 
 .modal-status-grid {
   margin-bottom: 14px;
+}
+
+.refill-history-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.refill-history-summary div {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(2, 6, 23, 0.3);
+}
+
+.refill-history-summary span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.refill-history-summary strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 16px;
+}
+
+.refill-history-table-wrap {
+  max-height: 520px;
+}
+
+.refill-history-table {
+  min-width: 1180px;
+}
+
+.history-message {
+  display: grid;
+  gap: 5px;
+  max-width: 420px;
+}
+
+.history-message small {
+  color: var(--muted);
+  line-height: 1.4;
 }
 
 .empty-log {
@@ -1137,6 +1565,7 @@ tbody tr:last-child td {
 
   .stats,
   .overview-grid,
+  .mode-toggle,
   .switch-grid,
   .compact-grid,
   .config-grid,
@@ -1157,9 +1586,22 @@ tbody tr:last-child td {
 
   .top-actions,
   .toolbar-actions,
+  .import-footer-row,
   .modal-footer {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .import-footer-row {
+    grid-template-columns: 1fr;
+  }
+
+  .import-file-card {
+    align-items: flex-start;
+  }
+
+  .file-action {
+    display: none;
   }
 
   .run-count-field {
