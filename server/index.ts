@@ -485,13 +485,15 @@ async function persistTasks(): Promise<void> {
   await writeJson(tasksFile, tasks);
 }
 
-async function importEmails(text: string, config = appConfig): Promise<{added: number; updated: number; invalid: number; total: number; invalidSamples: string[]}> {
+async function importEmails(text: string, config = appConfig): Promise<{added: number; updated: number; skipped: number; invalid: number; inputLines: number; total: number; invalidSamples: string[]}> {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   let added = 0;
   let updated = 0;
+  let skipped = 0;
   let invalid = 0;
   const invalidSamples: string[] = [];
   const byEmail = new Map(emails.map((item) => [item.email.toLowerCase(), item]));
+  const seenInBatch = new Set<string>();
 
   for (const line of lines) {
     let parsed: ParsedEmailLine | null = null;
@@ -507,6 +509,12 @@ async function importEmails(text: string, config = appConfig): Promise<{added: n
     }
 
     const key = parsed.email.toLowerCase();
+    if (seenInBatch.has(key)) {
+      skipped += 1;
+      continue;
+    }
+    seenInBatch.add(key);
+
     const existing = byEmail.get(key);
     if (existing) {
       existing.password = parsed.password;
@@ -536,7 +544,7 @@ async function importEmails(text: string, config = appConfig): Promise<{added: n
     }
   }
   await persistEmails();
-  return {added, updated, invalid, total: emails.length, invalidSamples};
+  return {added, updated, skipped, invalid, inputLines: lines.length, total: emails.length, invalidSamples};
 }
 
 async function loadBundleModules() {

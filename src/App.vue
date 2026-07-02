@@ -254,6 +254,10 @@
             </div>
           </div>
           <div class="modal-body import-body">
+            <label class="field">
+              <span>选择邮箱文件（txt）</span>
+              <input type="file" accept=".txt,text/plain" @change="loadEmailImportFile" />
+            </label>
             <textarea
               v-model="emailText"
               placeholder="支持：
@@ -265,7 +269,12 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                 <span>接码 API 域名</span>
                 <input v-model="form.mailApiBaseUrl" placeholder="http://wremail.cc/" />
               </label>
-              <button class="primary" :disabled="!emailText.trim()" @click="importEmails">导入邮箱</button>
+              <div class="row-actions">
+                <button class="ghost" :disabled="importingEmails" @click="emailText = ''; importResult = ''">清空</button>
+                <button class="primary" :disabled="!emailText.trim() || importingEmails" @click="importEmails">
+                  {{ importingEmails ? "导入中..." : "导入邮箱" }}
+                </button>
+              </div>
             </div>
             <pre v-if="importResult">{{ importResult }}</pre>
           </div>
@@ -451,6 +460,7 @@ const tasks = ref<TaskItem[]>([]);
 const selectedTask = ref<TaskItem | null>(null);
 const emailText = ref("");
 const importResult = ref("");
+const importingEmails = ref(false);
 const workspaceText = ref("");
 const runCount = ref(1);
 const toast = ref("");
@@ -608,14 +618,54 @@ async function refreshAll() {
   await Promise.all([loadSummary(), loadEmails(), loadTasks()]);
 }
 
+async function loadEmailImportFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  try {
+    emailText.value = await file.text();
+    importResult.value = "";
+    const lineCount = emailText.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
+    showToast(`已读取文件：${file.name}，${lineCount} 行`);
+  } catch (error) {
+    showToast(`读取文件失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    input.value = "";
+  }
+}
+
 async function importEmails() {
-  const data = await api<any>("/api/emails/import", {
-    method: "POST",
-    body: JSON.stringify({text: emailText.value, mailApiBaseUrl: form.mailApiBaseUrl}),
-  });
-  importResult.value = JSON.stringify(data, null, 2);
-  showToast(`导入完成：新增 ${data.added}，更新 ${data.updated}`);
-  await refreshAll();
+  if (importingEmails.value) return;
+  const text = emailText.value.trim();
+  if (!text) {
+    showToast("请先粘贴邮箱内容或选择 txt 文件");
+    return;
+  }
+  importingEmails.value = true;
+  importResult.value = "";
+  try {
+    const data = await api<any>("/api/emails/import", {
+      method: "POST",
+      body: JSON.stringify({text, mailApiBaseUrl: form.mailApiBaseUrl}),
+    });
+    importResult.value = [
+      `读取行数：${data.inputLines ?? "-"}`,
+      `新增：${data.added ?? 0}`,
+      `更新：${data.updated ?? 0}`,
+      `本次重复跳过：${data.skipped ?? 0}`,
+      `无效：${data.invalid ?? 0}`,
+      `邮箱池总数：${data.total ?? 0}`,
+      data.invalidSamples?.length ? `无效示例：\n${data.invalidSamples.map((item: string) => `- ${item}`).join("\n")}` : "",
+    ].filter(Boolean).join("\n");
+    showToast(`导入完成：新增 ${data.added ?? 0}，更新 ${data.updated ?? 0}，无效 ${data.invalid ?? 0}`);
+    await refreshAll();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    importResult.value = `导入失败：${message}`;
+    showToast(`导入失败：${message}`);
+  } finally {
+    importingEmails.value = false;
+  }
 }
 
 async function deleteEmail(id: string) {
