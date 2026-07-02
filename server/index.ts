@@ -846,6 +846,51 @@ function extractVerificationCode(payload: unknown): string {
   return "";
 }
 
+function parseSmsBowerTimestamp(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return undefined;
+    return value > 1_000_000_000_000 ? value : value * 1000;
+  }
+  const text = String(value).trim();
+  if (!text) return undefined;
+  if (/^\d{10,13}$/.test(text)) return parseSmsBowerTimestamp(Number(text));
+  const withOffset = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?\s*(?:GMT|UTC)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$/i);
+  if (withOffset) {
+    const [, y, mo, d, h, mi, s = "0", sign, oh, om = "0"] = withOffset;
+    const offsetMinutes = (Number(oh) * 60 + Number(om)) * (sign === "+" ? 1 : -1);
+    return Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s)) - offsetMinutes * 60_000;
+  }
+  if (/(?:Z|GMT|UTC|[+-]\d{2}:?\d{2})$/i.test(text)) {
+    const parsed = Date.parse(text.replace(" ", "T"));
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function extractSmsBowerCodeArrivalMs(payload: unknown): number | undefined {
+  const record = unwrapSmsBowerPayload(payload);
+  for (const key of [
+    "arrivedAt",
+    "arrivalAt",
+    "receivedAt",
+    "createdAt",
+    "updatedAt",
+    "arrival_time",
+    "arrive_time",
+    "received_at",
+    "created_at",
+    "updated_at",
+    "date",
+    "time",
+    "timestamp",
+  ]) {
+    const parsed = parseSmsBowerTimestamp(record[key]);
+    if (parsed !== undefined) return parsed;
+  }
+  return undefined;
+}
+
 async function getSmsBowerAccountSnapshot(): Promise<SmsBowerAccountSnapshot> {
   const apiKeyPresent = Boolean(appConfig.smsBowerApiKey);
   const base = {
@@ -974,48 +1019,61 @@ function createSmsBowerFissionChild(parent: EmailRecord): EmailRecord {
 async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label: string): Promise<string> {
   const id = asString(email.smsBowerMailId);
   if (!id) throw new Error(`SMSBower 邮箱缺少 activation id: ${email.email}`);
+  const waitStartedAt = Date.now();
+  task.waitingOtp = true;
+  task.waitingOtpLabel = label;
+  task.waitingOtpEmail = email.email;
+  task.waitingOtpSince = new Date(waitStartedAt).toISOString();
   appendLog(task, "info", `等待 SMSBower ${label} 验证码: ${email.email} activation=${id}`);
+  await persistTasks();
   let last = "";
-  for (let attempt = 1; attempt <= 60; attempt += 1) {
-    let payload: unknown;
-    try {
-      payload = await requestSmsBowerMail("getCode", {mailId: id});
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (isSmsBowerCodePendingMessage(message)) {
-        last = message;
-        if (attempt === 1 || attempt % 10 === 0) {
-          appendLog(task, "info", `SMSBower ${label} 验证码暂未收到，继续等待 (${attempt}/60)`);
+  try {
+    for (let attempt = 1; attempt <= 60; attempt += 1) {
+      let payload: unknown;
+      try {
+        payload = await requestSmsBowerMail("getCode", {mailId: id});
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isSmsBowerCodePendingMessage(message)) {
+          last = message;
+          if (attempt === 1 || attempt % 10 === 0) {
+            appendLog(task, "info", `SMSBower ${label} 验证码暂未收到，继续等待 (${attempt}/60)`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
         }
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        continue;
+        throw error;
       }
-      throw error;
-    }
-    const code = extractVerificationCode(payload);
-    if (code) {
-      const related = emails.filter((item) => item.smsBowerMailId === id);
-      const used = new Set(related.flatMap((item) => item.smsBowerMailUsedCodes || []));
-      if (used.has(code)) {
-        last = `SMSBower 返回已使用验证码 ${code}`;
-        if (attempt === 1 || attempt % 10 === 0) {
-          appendLog(task, "info", `SMSBower ${label} 返回旧验证码，继续等待新验证码 (${attempt}/60)`);
+      const code = extractVerificationCode(payload);
+      if (code) {
+        const arrivalMs = extractSmsBowerCodeArrivalMs(payload);
+        if (arrivalMs !== undefined && arrivalMs + 1000 < waitStartedAt) {
+          last = `SMSBower 返回旧邮件验证码 ${code}，抵达时间 ${new Date(arrivalMs).toISOString()}`;
+          if (attempt === 1 || attempt % 10 === 0) {
+            appendLog(task, "info", `SMSBower ${label} 返回旧邮件，继续等待新验证码 (${attempt}/60)`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
         }
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        continue;
+        const related = emails.filter((item) => item.smsBowerMailId === id);
+        for (const item of related) {
+          item.smsBowerMailUsedCodes = Array.from(new Set([...(item.smsBowerMailUsedCodes || []), code])).slice(-20);
+          item.updatedAt = nowIso();
+        }
+        await persistEmails();
+        appendLog(task, "ok", `SMSBower ${label} 验证码已获取${arrivalMs !== undefined ? `，抵达时间 ${new Date(arrivalMs).toISOString()}` : ""}`);
+        return code;
       }
-      for (const item of related) {
-        item.smsBowerMailUsedCodes = Array.from(new Set([...(item.smsBowerMailUsedCodes || []), code])).slice(-20);
-        item.updatedAt = nowIso();
-      }
-      await persistEmails();
-      appendLog(task, "ok", `SMSBower ${label} 验证码已获取`);
-      return code;
+      last = typeof payload === "string" ? payload : JSON.stringify(payload).slice(0, 180);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
     }
-    last = typeof payload === "string" ? payload : JSON.stringify(payload).slice(0, 180);
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    throw new Error(`SMSBower 邮箱中未找到验证码: ${email.email}; last=${last}`);
+  } finally {
+    task.waitingOtp = false;
+    task.waitingOtpLabel = undefined;
+    task.waitingOtpEmail = undefined;
+    task.waitingOtpSince = undefined;
   }
-  throw new Error(`SMSBower 邮箱中未找到验证码: ${email.email}; last=${last}`);
 }
 
 function isSmsBowerCodePendingMessage(message: string): boolean {
@@ -1029,6 +1087,14 @@ async function setSmsBowerMailStatus(email: EmailRecord, status: number): Promis
   email.smsBowerMailClosedAt = nowIso();
   email.smsBowerMailCloseStatus = status;
   email.updatedAt = nowIso();
+}
+
+async function requestSmsBowerNextMailCode(email: EmailRecord, task?: K12Task, reason = "请求等待下一个验证码"): Promise<void> {
+  const id = asString(email.smsBowerMailId);
+  if (!id || email.smsBowerMailClosedAt) return;
+  await requestSmsBowerMail("setStatus", {id, mailId: id, status: 5});
+  email.updatedAt = nowIso();
+  if (task) appendLog(task, "info", `SMSBower ${reason}: activation=${id}`);
 }
 
 async function finalizeSmsBowerMailIfDone(email: EmailRecord): Promise<void> {
@@ -1056,6 +1122,7 @@ async function enqueueNextSmsBowerFissionTask(parent: EmailRecord, task: K12Task
     return undefined;
   }
   const remaining = Math.max(0, task.smsBowerFissionRemainingAfterThis || 0);
+  await requestSmsBowerNextMailCode(parent, task, "母邮箱成功，已请求等待下一个验证码");
   const child = createSmsBowerFissionChild(parent);
   const childTask = enqueueK12Task(child, {
     route: task.route,
