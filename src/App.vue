@@ -65,49 +65,82 @@
           <h2>任务列表</h2>
           <p class="toolbar-subtitle">点击任务行打开日志弹窗。</p>
         </div>
-        <div class="toolbar-actions">
-          <button class="ghost" :disabled="!selectedCheckableTaskIds.length || checkingTasks" @click="checkSelectedTasks">
-            {{ checkingTasks ? "测活中..." : `测活选中 ${selectedCheckableTaskIds.length}` }}
-          </button>
-          <button class="ghost" :disabled="!selectedTaskIds.length" @click="repairSelectedTasks">
-            修复AT {{ selectedTaskIds.length }}
-          </button>
-          <button class="ghost" :disabled="checkingTasks" @click="loadInactiveTaskData">
-            一键失活数据
-          </button>
-          <button class="ghost" :disabled="startingSub2apiRefill || sub2apiRefillStatus.running" @click="startSub2apiRefill">
-            {{ startingSub2apiRefill || sub2apiRefillStatus.running ? "补号检测中..." : "启动补号" }}
-          </button>
-          <button class="ghost" :disabled="startingSub2apiAutoAtRepair || sub2apiRefillStatus.autoAtRepair.running" @click="startSub2apiAutoAtRepair">
-            {{ startingSub2apiAutoAtRepair || sub2apiRefillStatus.autoAtRepair.running ? "补AT自检中..." : "自检补AT" }}
-          </button>
-          <button class="ghost" @click="openSub2apiRefillHistory">
-            补号日志
-          </button>
-          <button class="ghost" :disabled="!inactiveMarkedTasks.length" @click="selectInactiveMarkedTasks">
-            勾选失活 {{ inactiveMarkedTasks.length }}
-          </button>
-          <button class="ghost" :disabled="!topUpFissionGroups.length || toppingUpAllFission" @click="continueAllFission">
-            {{ toppingUpAllFission ? "补分裂中..." : `一键补分裂 ${topUpFissionGroups.length}` }}
-          </button>
-          <button class="ghost" :disabled="!summary.tasks.failed || retryingFailedTasks" @click="retryFailedTasks">
-            {{ retryingFailedTasks ? "重跑中..." : `重跑失败 ${summary.tasks.failed}` }}
-          </button>
-          <button class="danger" :disabled="!summary.tasks.failed" @click="clearFailedTasks">
-            清理失败 {{ summary.tasks.failed }}
-          </button>
-          <label class="field run-count-field">
-            <span>本次处理数量</span>
-            <input v-model.number="runCount" type="number" min="1" />
-          </label>
-          <button class="ghost" @click="openEmailImport">邮箱导入</button>
-          <button class="ghost" @click="openEmailPool">邮箱池</button>
-          <button class="primary" :disabled="startTasksDisabled" @click="startTasks">
-            {{ busy ? "运行中" : `启动 ${launchTaskCount} 个任务` }}
-          </button>
-          <span v-if="form.smsBowerMailEnabled" class="launch-mode-badge">
-            {{ form.gmailMailProvider === "emailnator" ? "Emailnator Gmail" : "SMSBower Gmail" }} 动态模式，不占用邮箱池
-          </span>
+        <div class="toolbar-actions task-toolbar-layout">
+          <div class="toolbar-action-groups">
+            <div class="toolbar-group">
+              <span class="toolbar-group-label">检测修复</span>
+              <button class="ghost" :disabled="!selectedCheckableTaskIds.length || checkingTasks" @click="checkSelectedTasks">
+                {{ checkingTasks ? "测活中..." : `测活选中 ${selectedCheckableTaskIds.length}` }}
+              </button>
+              <button class="ghost" :disabled="!selectedTaskIds.length" @click="repairSelectedTasks">
+                修复AT {{ selectedTaskIds.length }}
+              </button>
+              <button class="ghost" :disabled="checkingTasks" @click="loadInactiveTaskData">
+                一键失活数据
+              </button>
+              <button class="ghost" :disabled="!inactiveMarkedTasks.length" @click="selectInactiveMarkedTasks">
+                勾选失活 {{ inactiveMarkedTasks.length }}
+              </button>
+            </div>
+
+            <div class="toolbar-group">
+              <span class="toolbar-group-label">自动任务</span>
+              <button class="ghost" :disabled="startingSub2apiRefill || sub2apiRefillStatus.running" @click="startSub2apiRefill">
+                {{ startingSub2apiRefill || sub2apiRefillStatus.running ? "补号检测中..." : "启动补号" }}
+              </button>
+              <button class="ghost" :disabled="startingSub2apiAutoAtRepair || sub2apiRefillStatus.autoAtRepair.running" @click="startSub2apiAutoAtRepair">
+                {{ startingSub2apiAutoAtRepair || sub2apiRefillStatus.autoAtRepair.running ? "补AT自检中..." : "自检补AT" }}
+              </button>
+              <button class="ghost" @click="openSub2apiRefillHistory">
+                补号日志
+              </button>
+              <button class="ghost" :disabled="!topUpFissionGroups.length || toppingUpAllFission" @click="continueAllFission">
+                {{ toppingUpAllFission ? "补分裂中..." : `一键补分裂 ${topUpFissionGroups.length}` }}
+              </button>
+            </div>
+
+            <div class="toolbar-group danger-group">
+              <span class="toolbar-group-label">危险操作</span>
+              <button class="danger" :disabled="!activeTaskCount || stoppingActiveTasks" @click="cancelActiveTasks">
+                {{ stoppingActiveTasks ? "停止中..." : `停止全部 ${activeTaskCount}` }}
+              </button>
+              <button class="ghost" :disabled="!summary.tasks.failed || retryingFailedTasks" @click="retryFailedTasks">
+                {{ retryingFailedTasks ? "重跑中..." : `重跑失败 ${summary.tasks.failed}` }}
+              </button>
+              <button class="danger" :disabled="!summary.tasks.failed" @click="clearFailedTasks">
+                清理失败 {{ summary.tasks.failed }}
+              </button>
+            </div>
+          </div>
+
+          <div class="task-launch-strip">
+            <div class="launch-state-row">
+              <span :class="['task-state-pill', busy ? 'busy' : 'idle']">
+                {{ busy ? `运行 ${summary.tasks.running} / 队列 ${summary.tasks.queued}` : "空闲" }}
+              </span>
+              <span v-if="form.smsBowerMailEnabled" class="launch-mode-badge">
+                {{ form.gmailMailProvider === "emailnator" ? "Emailnator Gmail" : "SMSBower Gmail" }} 动态模式，不占用邮箱池
+              </span>
+            </div>
+            <div class="launch-control-row">
+              <label class="field run-count-field compact-run-count">
+                <span>本次处理数量</span>
+                <input v-model.number="runCount" type="number" min="1" />
+              </label>
+              <label class="field run-count-field compact-run-count workspace-mode-field">
+                <span>空间模式</span>
+                <select v-model="workspaceLaunchMode">
+                  <option value="all">每空间</option>
+                  <option value="random-one">随机1个</option>
+                </select>
+              </label>
+              <button class="ghost" @click="openEmailImport">邮箱导入</button>
+              <button class="ghost" @click="openEmailPool">邮箱池</button>
+              <button class="primary" :disabled="startTasksDisabled" @click="startTasks">
+                {{ busy ? "运行中" : `启动 ${launchTaskCount} 个任务` }}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -119,6 +152,7 @@
                 <input type="checkbox" :checked="allCheckableTasksSelected" @change="toggleAllCheckableTasks" />
               </th>
               <th>状态</th>
+              <th>空间状态</th>
               <th>邮箱</th>
               <th>动作</th>
               <th>AT</th>
@@ -128,67 +162,148 @@
             </tr>
           </thead>
           <tbody>
-            <template v-for="group in pagedTaskGroups" :key="group.key">
+            <template v-for="(rootGroup, rootIndex) in pagedTaskRootGroups" :key="rootGroup.key">
               <tr
-                :class="['task-row', 'task-group-row', { active: taskGroupHasSelectedTask(group), selected: isTaskGroupPartlySelected(group), expanded: isTaskGroupExpanded(group.key) }]"
-                @click="openOrToggleTaskGroup(group)"
+                :class="['task-row', 'task-group-row', 'task-root-row', taskTreeToneClass(rootIndex), { active: taskGroupHasSelectedTask(rootGroup), selected: isTaskGroupPartlySelected(rootGroup), expanded: isTaskGroupExpanded(rootGroup.key), 'task-root-gap': rootIndex > 0 }]"
+                @click="toggleTaskGroup(rootGroup)"
               >
                 <td class="select-col" @click.stop>
-                  <input type="checkbox" :checked="isTaskGroupFullySelected(group)" @change="toggleTaskGroupSelection(group)" />
+                  <input type="checkbox" :checked="isTaskGroupFullySelected(rootGroup)" @change="toggleTaskGroupSelection(rootGroup)" />
                 </td>
                 <td>
                   <div class="status-stack">
-                    <span :class="['status', group.status]">{{ statusText(group.status) }}</span>
-                    <small v-if="group.tasks.length > 1">{{ group.tasks.length }} 条</small>
+                    <span :class="['status', rootGroup.status]">{{ statusText(rootGroup.status) }}</span>
+                    <small>{{ rootGroup.workspaceGroups.length }} 空间</small>
                   </div>
+                </td>
+                <td>
+                  <span :class="['workspace-state-badge', rootWorkspaceState(rootGroup).kind]" :title="rootWorkspaceState(rootGroup).title">
+                    {{ rootWorkspaceState(rootGroup).text }}
+                  </span>
                 </td>
                 <td>
                   <div class="task-email-cell">
                     <div class="cell-with-action">
                       <button
-                        v-if="group.detailTasks.length"
                         class="ghost tiny expand-toggle"
-                        :title="isTaskGroupExpanded(group.key) ? '收起明细' : '展开明细'"
-                        @click.stop="toggleTaskGroup(group)"
+                        :title="isTaskGroupExpanded(rootGroup.key) ? '收起空间' : '展开空间'"
+                        @click.stop="toggleTaskGroup(rootGroup)"
                       >
-                        {{ isTaskGroupExpanded(group.key) ? "-" : "+" }}
+                        {{ isTaskGroupExpanded(rootGroup.key) ? "-" : "+" }}
                       </button>
-                      <span class="mono clipped">{{ group.rootEmail }}</span>
-                      <button class="ghost tiny" @click.stop="copyText(group.rootEmail, '邮箱已复制')">复制</button>
+                      <span class="tree-level-chip root">母号 {{ taskRootNumber(taskPageStart, rootIndex) }}</span>
+                      <span class="mono clipped">{{ rootGroup.rootEmail }}</span>
+                      <button class="ghost tiny" @click.stop="copyText(rootGroup.rootEmail, '邮箱已复制')">复制</button>
                     </div>
                     <div class="task-meta-row">
-                      <span :class="['fission-source-badge', group.source]">{{ group.sourceLabel }}</span>
-                      <span v-if="group.fissionTargetChildren > 0" class="fission-progress">
-                        子号 {{ group.fissionSuccessChildren }}/{{ group.fissionTargetChildren }}
+                      <span :class="['fission-source-badge', rootGroup.source]">{{ rootGroup.sourceLabel }}</span>
+                      <span v-if="rootGroup.fissionTargetChildren > 0" class="fission-progress">
+                        子号 {{ rootGroup.fissionSuccessChildren }}/{{ rootGroup.fissionTargetChildren }}
                       </span>
-                      <span v-if="group.fissionFailedChildren > 0" class="fission-progress warn">
-                        失败 {{ group.fissionFailedChildren }}
+                      <span v-if="rootGroup.fissionFailedChildren > 0" class="fission-progress warn">
+                        失败 {{ rootGroup.fissionFailedChildren }}
                       </span>
-                      <small v-if="group.detailTasks.length" class="muted">点击展开 {{ group.detailTasks.length }} 条</small>
+                      <small class="muted">点击展开 {{ rootGroup.workspaceGroups.length }} 个 workspace</small>
                     </div>
                   </div>
                 </td>
-                <td>{{ group.primaryTask.route }}</td>
+                <td>{{ rootGroup.primaryTask.route }}</td>
                 <td>
                   <div class="cell-with-action">
-                    <span class="mono clipped">{{ group.primaryTask.accessTokenPreview || "pending" }}</span>
-                    <span v-if="group.primaryTask.accessTokenLiveness" :class="['liveness-badge', group.primaryTask.accessTokenLiveness]" :title="group.primaryTask.accessTokenLivenessMessage || ''">
-                      {{ livenessText(group.primaryTask.accessTokenLiveness) }}
+                    <span class="mono clipped">{{ rootGroup.primaryTask.accessTokenPreview || "pending" }}</span>
+                    <span v-if="rootGroup.primaryTask.accessTokenLiveness" :class="['liveness-badge', rootGroup.primaryTask.accessTokenLiveness]" :title="rootGroup.primaryTask.accessTokenLivenessMessage || ''">
+                      {{ livenessText(rootGroup.primaryTask.accessTokenLiveness) }}
                     </span>
                     <button
                       class="ghost tiny"
-                      :disabled="!group.primaryTask.accessToken && !group.primaryTask.accessTokenPreview"
-                      @click.stop="copyAccessToken(group.primaryTask)"
+                      :disabled="!rootGroup.primaryTask.accessToken && !rootGroup.primaryTask.accessTokenPreview"
+                      @click.stop="copyAccessToken(rootGroup.primaryTask)"
                     >
                       复制
                     </button>
                   </div>
                 </td>
-                <td class="mono clipped">{{ group.primaryTask.sub2apiAccount || "-" }}</td>
-                <td>{{ group.primaryTask.workspaceResults.filter((r) => r.ok).length }}/{{ group.primaryTask.workspaceIds.length }}</td>
+                <td class="mono clipped">{{ rootGroup.primaryTask.sub2apiAccount || "-" }}</td>
+                <td>{{ rootGroup.workspaceGroups.filter((item) => item.status === "success").length }}/{{ rootGroup.workspaceGroups.length }}</td>
                 <td>
                   <div class="row-actions">
-                    <button class="ghost small" @click.stop="openTaskLog(group.primaryTask)">日志</button>
+                    <button class="ghost small" @click.stop="openTaskLog(rootGroup.primaryTask)">日志</button>
+                    <button
+                      v-if="activeTaskIdsOfGroup(rootGroup).length"
+                      class="danger small"
+                      @click.stop="cancelTaskGroup(rootGroup)"
+                    >
+                      取消
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              <template v-for="(group, workspaceIndex) in isTaskGroupExpanded(rootGroup.key) ? rootGroup.workspaceGroups : []" :key="group.key">
+                <tr
+                  :class="['task-row', 'task-group-row', 'task-workspace-row', taskTreeToneClass(rootIndex), taskWorkspaceToneClass(workspaceIndex), { active: taskGroupHasSelectedTask(group), selected: isTaskGroupPartlySelected(group), expanded: isTaskGroupExpanded(group.key) }]"
+                  @click="openOrToggleTaskGroup(group)"
+                >
+                  <td class="select-col" @click.stop>
+                    <input type="checkbox" :checked="isTaskGroupFullySelected(group)" @change="toggleTaskGroupSelection(group)" />
+                  </td>
+                  <td>
+                    <div class="status-stack">
+                      <span :class="['status', group.status]">{{ statusText(group.status) }}</span>
+                      <small v-if="group.tasks.length > 1">{{ group.tasks.length }} 条</small>
+                    </div>
+                  </td>
+                  <td>
+                    <span :class="['workspace-state-badge', workspaceState(group).kind]" :title="workspaceState(group).title">
+                      {{ workspaceState(group).text }}
+                    </span>
+                  </td>
+                  <td>
+                    <div class="task-email-cell">
+                      <div class="cell-with-action">
+                        <button
+                          class="ghost tiny expand-toggle"
+                          :title="isTaskGroupExpanded(group.key) ? '收起任务明细' : '展开任务明细'"
+                          @click.stop="toggleTaskGroup(group)"
+                        >
+                          {{ isTaskGroupExpanded(group.key) ? "-" : "+" }}
+                        </button>
+                        <span class="detail-node">空间</span>
+                        <span class="tree-level-chip workspace">{{ taskWorkspaceNumber(taskPageStart, rootIndex, workspaceIndex) }}</span>
+                        <span class="mono clipped">{{ workspaceLabel(group) }}</span>
+                      </div>
+                      <div class="task-meta-row">
+                        <span :class="['fission-source-badge', group.source]">{{ group.sourceLabel }}</span>
+                        <span v-if="group.fissionTargetChildren > 0" class="fission-progress">
+                          子号 {{ group.fissionSuccessChildren }}/{{ group.fissionTargetChildren }}
+                        </span>
+                        <span v-if="group.fissionFailedChildren > 0" class="fission-progress warn">
+                          失败 {{ group.fissionFailedChildren }}
+                        </span>
+                        <small class="muted">点击展开 {{ group.detailTasks.length }} 条</small>
+                      </div>
+                    </div>
+                  </td>
+                  <td>{{ group.primaryTask.route }}</td>
+                  <td>
+                    <div class="cell-with-action">
+                      <span class="mono clipped">{{ group.primaryTask.accessTokenPreview || "pending" }}</span>
+                      <span v-if="group.primaryTask.accessTokenLiveness" :class="['liveness-badge', group.primaryTask.accessTokenLiveness]" :title="group.primaryTask.accessTokenLivenessMessage || ''">
+                        {{ livenessText(group.primaryTask.accessTokenLiveness) }}
+                      </span>
+                      <button
+                        class="ghost tiny"
+                        :disabled="!group.primaryTask.accessToken && !group.primaryTask.accessTokenPreview"
+                        @click.stop="copyAccessToken(group.primaryTask)"
+                      >
+                        复制
+                      </button>
+                    </div>
+                  </td>
+                  <td class="mono clipped">{{ group.primaryTask.sub2apiAccount || "-" }}</td>
+                  <td>{{ group.primaryTask.workspaceResults.filter((r) => r.ok).length }}/{{ group.primaryTask.workspaceIds.length }}</td>
+                  <td>
+                    <div class="row-actions">
+                      <button class="ghost small" @click.stop="openTaskLog(group.primaryTask)">日志</button>
                     <button
                       class="ghost small"
                       :disabled="!canCheckTaskAt(group.primaryTask) || checkingTaskAtId === group.primaryTask.id"
@@ -229,9 +344,9 @@
                 </td>
               </tr>
               <tr
-                v-for="task in isTaskGroupExpanded(group.key) ? group.detailTasks : []"
+                v-for="(task, taskIndex) in isTaskGroupExpanded(group.key) ? group.detailTasks : []"
                 :key="task.id"
-                :class="['task-row', 'task-detail-row', { active: selectedTask?.id === task.id, selected: selectedTaskIds.includes(task.id) }]"
+                :class="['task-row', 'task-detail-row', taskTreeToneClass(rootIndex), taskWorkspaceToneClass(workspaceIndex), { active: selectedTask?.id === task.id, selected: selectedTaskIds.includes(task.id) }]"
                 @click="openTaskLog(task)"
               >
                 <td class="select-col" @click.stop>
@@ -239,9 +354,15 @@
                 </td>
                 <td><span :class="['status', task.status]">{{ statusText(task.status) }}</span></td>
                 <td>
+                  <span :class="['workspace-state-badge', taskWorkspaceState(task).kind]" :title="taskWorkspaceState(task).title">
+                    {{ taskWorkspaceState(task).text }}
+                  </span>
+                </td>
+                <td>
                   <div class="task-detail-email">
                     <div class="cell-with-action">
-                      <span class="detail-node">子</span>
+                      <span class="detail-node">{{ task.id === group.primaryTask.id ? "主" : "子" }}</span>
+                      <span class="tree-level-chip detail">{{ taskDetailNumber(taskPageStart, rootIndex, workspaceIndex, taskIndex) }}</span>
                       <span class="mono clipped">{{ task.email }}</span>
                       <button class="ghost tiny" @click.stop="copyText(task.email, '邮箱已复制')">复制</button>
                     </div>
@@ -303,16 +424,17 @@
                   </div>
                 </td>
               </tr>
+              </template>
             </template>
-            <tr v-if="!taskGroups.length">
-              <td colspan="8" class="empty">暂无任务。导入邮箱后可从上方启动流程。</td>
+            <tr v-if="!taskRootGroups.length">
+              <td colspan="9" class="empty">暂无任务。导入邮箱后可从上方启动流程。</td>
             </tr>
           </tbody>
         </table>
       </div>
-      <div v-if="taskGroups.length" class="pagination-bar">
+      <div v-if="taskRootGroups.length" class="pagination-bar">
         <span>
-          共 {{ taskGroups.length }} 个母号 / {{ sortedTasks.length }} 个任务尝试，当前 {{ taskPageStart + 1 }}-{{ taskPageEnd }}
+          共 {{ taskRootGroups.length }} 个母号 / {{ taskGroups.length }} 个空间 / {{ sortedTasks.length }} 个任务尝试，当前 {{ taskPageStart + 1 }}-{{ taskPageEnd }}
         </span>
         <div class="pagination-actions">
           <button class="ghost small" :disabled="taskPage <= 1" @click="taskPage = 1">首页</button>
@@ -348,7 +470,7 @@
                 <span class="pill">{{ workspaceCount }} 个 workspace</span>
               </div>
               <label class="field">
-                <span>K12 Workspace ID（一行一个或逗号分隔；多个时每个邮箱随机选一个）</span>
+                <span>K12 Workspace ID（一行一个或逗号分隔；启动时可选择每空间或随机1个）</span>
                 <textarea v-model="workspaceText" class="workspace-box"></textarea>
               </label>
               <div class="switch-grid">
@@ -356,7 +478,7 @@
                   <input v-model="form.runWorkspaceJoin" type="checkbox" />
                   <span>
                     <strong>执行 K12 空间脚本</strong>
-                    <small>多个 workspace 时，每个邮箱任务会随机抽取其中一个执行 request/accept。</small>
+                    <small>多个 workspace 时，启动区可选择“每空间”逐个申请，或“随机1个”只抽一个空间执行 request/accept。</small>
                   </span>
                 </label>
                 <label class="switch-card">
@@ -389,6 +511,10 @@
                 <label class="field">
                   <span>间隔 ms</span>
                   <input v-model.number="form.joinIntervalMs" type="number" min="0" />
+                </label>
+                <label class="field">
+                  <span>邮箱收码冷却 ms</span>
+                  <input v-model.number="form.poolFissionMailboxOtpCooldownMs" type="number" min="0" max="3600000" />
                 </label>
               </div>
               <label class="field">
@@ -776,10 +902,10 @@
                 <input v-model.number="splitAliasCount" type="number" min="1" max="50" />
               </label>
               <button class="ghost small" :disabled="!selectableParentEmails.length" @click="selectParentEmails">
-                只选母邮箱 {{ selectableParentEmails.length }}
+                只选可启动母号 {{ selectableParentEmails.length }}
               </button>
-              <button class="primary small" :disabled="!selectedRunnableEmailIds.length" @click="startSelectedEmailTasks">
-                启动选中 {{ selectedRunnableEmailIds.length }}
+              <button class="primary small" :disabled="!selectedRunnableEmailIds.length" :title="selectedLaunchButtonTitle" @click="startSelectedEmailTasks">
+                {{ selectedLaunchButtonText }}
               </button>
               <button class="ghost small" :disabled="!selectedRepairableEmailIds.length || checkingAccessTokens" @click="checkSelectedAccessTokens">
                 {{ checkingAccessTokens ? "检验中..." : `检验AT ${selectedRepairableEmailIds.length}` }}
@@ -1043,7 +1169,25 @@ import {
   isK12RepairNeededResult,
   mergeK12RepairScanResults,
 } from "./emailPoolRepairFilter";
-import {buildTaskGroups, canTopUpTaskGroupFission, type TaskGroupRow} from "./taskGroups";
+import {
+  isRunnableMotherEmail,
+  launchTaskTotal,
+  summarizeLaunchSelection,
+  type WorkspaceLaunchMode,
+} from "./emailLaunch";
+import {
+  activeTaskIdsOfGroup,
+  buildTaskGroups,
+  buildTaskRootGroups,
+  canTopUpTaskGroupFission,
+  visibleTaskTreeKeys,
+  visibleTasksForWorkspaceIds,
+  type TaskGroupRow,
+  type TaskRootGroupRow,
+} from "./taskGroups";
+import {taskDetailNumber, taskRootNumber, taskWorkspaceNumber} from "./taskTreeNumber";
+import {taskTreeToneClass, taskWorkspaceToneClass} from "./taskTreeTone";
+import {workspaceStateFromRootGroup, workspaceStateFromStatus, workspaceStateFromTask} from "./workspaceDisplayState";
 
 interface EmailItem {
   id: string;
@@ -1063,14 +1207,17 @@ interface TaskItem {
   kind?: string;
   emailId?: string;
   email: string;
+  rootEmail?: string;
   parentEmail?: string;
   otpMode?: string;
   status: string;
   route: string;
+  error?: string;
   createdAt?: string;
   updatedAt?: string;
   startedAt?: string;
   finishedAt?: string;
+  notBefore?: string;
   accessToken?: string;
   accessTokenPreview?: string;
   accessTokenLiveness?: string;
@@ -1089,12 +1236,27 @@ interface TaskItem {
   smsBowerFissionChildrenRemaining?: number;
   smsBowerBatchId?: string;
   smsBowerBatchTargetSuccesses?: number;
+  workspaceBlocked?: boolean;
+  workspaceBlockReason?: string;
   workspaceIds: string[];
   workspaceResults: Array<{ok: boolean}>;
   logs: Array<{at: string; level: string; message: string}>;
 }
 
+interface WorkspaceBlockItem {
+  rootEmail: string;
+  workspaceId: string;
+  reason: string;
+  createdAt: string;
+  updatedAt: string;
+  scope?: "root" | "email";
+  source?: string;
+  accountName?: string;
+}
+
 type TaskTableGroup = TaskGroupRow<TaskItem>;
+type TaskTableRootGroup = TaskRootGroupRow<TaskItem>;
+type TaskSelectionGroup = {key: string; tasks: TaskItem[]; primaryTask: TaskItem};
 
 interface AccessTokenCheckItem {
   emailId?: string;
@@ -1103,6 +1265,7 @@ interface AccessTokenCheckItem {
   accountId?: string;
   ok: boolean;
   issue?: string;
+  repairable?: boolean;
   status: number;
   message: string;
   latencyMs: number;
@@ -1143,6 +1306,7 @@ interface Sub2ApiAutoAtRepairResult {
   createdTasks: number;
   skippedRunning: number;
   skippedUnmatched: number;
+  skippedTerminal?: number;
   message: string;
   samples?: string[];
 }
@@ -1205,6 +1369,7 @@ const sub2apiRefillStatus = reactive<Sub2ApiRefillStatus>({
 const sub2apiRefillHistory = ref<Sub2ApiRefillResult[]>([]);
 const emails = ref<EmailItem[]>([]);
 const tasks = ref<TaskItem[]>([]);
+const workspaceBlocks = ref<WorkspaceBlockItem[]>([]);
 const selectedTask = ref<TaskItem | null>(null);
 const emailText = ref("");
 const emailImportMode = ref<"auto" | "manual">("auto");
@@ -1217,6 +1382,7 @@ const checkingAccessTokens = ref(false);
 const checkingTasks = ref(false);
 const checkingTaskAtId = ref("");
 const retryingFailedTasks = ref(false);
+const stoppingActiveTasks = ref(false);
 const toppingUpFissionKey = ref("");
 const toppingUpAllFission = ref(false);
 const accessTokenCheckResult = ref("");
@@ -1233,6 +1399,7 @@ const dataImportInput = ref<HTMLInputElement | null>(null);
 const splitAliasCount = ref(4);
 const workspaceText = ref("");
 const runCount = ref(1);
+const workspaceLaunchMode = ref<WorkspaceLaunchMode>("all");
 const toast = ref("");
 const savingConfig = ref(false);
 const importingData = ref(false);
@@ -1267,6 +1434,7 @@ const form = reactive({
   workspaceIds: [] as string[],
   route: "request",
   joinIntervalMs: 1500,
+  poolFissionMailboxOtpCooldownMs: 300000,
   taskConcurrency: 1,
   runWorkspaceJoin: true,
   runSub2Api: true,
@@ -1302,11 +1470,13 @@ const form = reactive({
 });
 
 const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 0);
+const activeTaskCount = computed(() => summary.tasks.running + summary.tasks.queued);
 const workspaceCount = computed(() => parseWorkspaceIds(workspaceText.value).length);
-const launchTaskCount = computed(() => {
+const launchMotherCount = computed(() => {
   const count = Math.max(1, Number(runCount.value) || 1);
-  return form.smsBowerMailEnabled ? count : Math.min(count, emails.value.filter((item) => item.status === "free").length);
+  return form.smsBowerMailEnabled ? count : Math.min(count, emails.value.filter(isRunnableMotherEmail).length);
 });
+const launchTaskCount = computed(() => launchTaskTotal(launchMotherCount.value, workspaceCount.value, workspaceLaunchMode.value));
 const startTasksDisabled = computed(() => busy.value || (!form.smsBowerMailEnabled && launchTaskCount.value <= 0));
 const filteredEmails = computed(() => emails.value.filter((item) => matchesEmailPoolFilter(item, emailPoolFilter.value) && matchesEmailPoolSearch(item)));
 const atRepairNeededEmails = computed(() => emails.value.filter((item) => isK12RepairNeededResult(emailAtCheckResults.value[item.id]) && canRepairEmail(item)));
@@ -1322,9 +1492,35 @@ const emailPoolFilters = computed<Array<{value: EmailPoolFilter; label: string; 
   {value: "banned", label: "封号", count: emails.value.filter((item) => item.status === "banned").length},
   {value: "bannedChild", label: "封号子号", count: emails.value.filter((item) => Boolean(item.parentEmail) && item.status === "banned").length},
 ]);
-const selectedRunnableEmailIds = computed(() => filteredEmails.value
-  .filter((item) => selectedEmailIds.value.includes(item.id) && (item.status === "free" || item.status === "failed"))
+const selectedVisibleEmailIds = computed(() => filteredEmails.value
+  .filter((item) => selectedEmailIds.value.includes(item.id))
   .map((item) => item.id));
+const selectedRunnableEmailIds = computed(() => filteredEmails.value
+  .filter((item) => selectedEmailIds.value.includes(item.id) && isRunnableMotherEmail(item))
+  .map((item) => item.id));
+const selectedLaunchSummary = computed(() => summarizeLaunchSelection({
+  selectedCount: selectedVisibleEmailIds.value.length,
+  runnableMotherCount: selectedRunnableEmailIds.value.length,
+  workspaceCount: workspaceCount.value,
+  workspaceLaunchMode: workspaceLaunchMode.value,
+}));
+const selectedRunnableTaskCount = computed(() => selectedLaunchSummary.value.taskCount);
+function launchWorkspaceModeText(multiplier: number) {
+  if (workspaceLaunchMode.value === "random-one") return "随机1空间";
+  return multiplier > 1 ? `${multiplier}空间` : "1批";
+}
+const selectedLaunchButtonText = computed(() => {
+  const summary = selectedLaunchSummary.value;
+  const workspaceText = launchWorkspaceModeText(summary.workspaceMultiplier);
+  if (!summary.selectedCount) return `启动选中 ${summary.taskCount}`;
+  const skippedText = summary.skippedCount ? `，跳过${summary.skippedCount}` : "";
+  return `启动选中 ${summary.taskCount}（${summary.runnableMotherCount}×${workspaceText}${skippedText}）`;
+});
+const selectedLaunchButtonTitle = computed(() => {
+  const summary = selectedLaunchSummary.value;
+  const skippedText = summary.skippedCount ? `；跳过 ${summary.skippedCount} 个不可启动（子号/运行中）` : "";
+  return `已勾选 ${summary.selectedCount} 个；可启动母号 ${summary.runnableMotherCount} 个；空间模式 ${launchWorkspaceModeText(summary.workspaceMultiplier)}；任务数 ${summary.runnableMotherCount} × ${summary.workspaceMultiplier} = ${summary.taskCount}${skippedText}`;
+});
 const selectedRepairableEmailIds = computed(() => emails.value
   .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
   .map((item) => item.id));
@@ -1336,18 +1532,19 @@ const allCheckableTasksSelected = computed(() => checkableTasks.value.length > 0
 const inactiveMarkedTasks = computed(() => tasks.value.filter((item) => item.accessTokenLiveness === "inactive" || item.accessTokenLiveness === "banned"));
 const sortedTasks = computed(() => {
   const rank = (status: string) => status === "running" ? 0 : status === "queued" ? 1 : 2;
-  return tasks.value
+  return visibleTasksForWorkspaceIds(tasks.value, parseWorkspaceIds(workspaceText.value))
     .map((task, index) => ({task, index}))
     .sort((a, b) => rank(a.task.status) - rank(b.task.status) || a.index - b.index)
     .map((item) => item.task);
 });
 const taskGroups = computed(() => buildTaskGroups(sortedTasks.value, {minimumTargetChildren: form.smsBowerGmailFissionCount}));
+const taskRootGroups = computed(() => buildTaskRootGroups(sortedTasks.value, {minimumTargetChildren: form.smsBowerGmailFissionCount}));
 const topUpFissionGroups = computed(() => taskGroups.value.filter(canTopUpFission));
-const taskTotalPages = computed(() => Math.max(1, Math.ceil(taskGroups.value.length / taskPageSize)));
+const taskTotalPages = computed(() => Math.max(1, Math.ceil(taskRootGroups.value.length / taskPageSize)));
 const taskPageStart = computed(() => (taskPage.value - 1) * taskPageSize);
-const taskPageEnd = computed(() => Math.min(taskGroups.value.length, taskPageStart.value + taskPageSize));
-const pagedTaskGroups = computed(() => taskGroups.value.slice(taskPageStart.value, taskPageEnd.value));
-const selectableParentEmails = computed(() => filteredEmails.value.filter((item) => !item.parentEmail && item.status !== "running"));
+const taskPageEnd = computed(() => Math.min(taskRootGroups.value.length, taskPageStart.value + taskPageSize));
+const pagedTaskRootGroups = computed(() => taskRootGroups.value.slice(taskPageStart.value, taskPageEnd.value));
+const selectableParentEmails = computed(() => filteredEmails.value.filter(isRunnableMotherEmail));
 const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
 const smsBowerApiKeyPlaceholder = computed(() => form.smsBowerApiKey || smsBowerApiKeySaved.value ? "已设置 Key，留空则不修改" : "填写 SMSBower API Key");
 const smsBowerBalanceText = computed(() => {
@@ -1394,8 +1591,8 @@ watch(taskTotalPages, (pages) => {
   if (taskPage.value < 1) taskPage.value = 1;
 }, {immediate: true});
 
-watch(taskGroups, (groups) => {
-  const visibleKeys = new Set(groups.map((group) => group.key));
+watch([taskGroups, taskRootGroups], ([groups, rootGroups]) => {
+  const visibleKeys = new Set(visibleTaskTreeKeys(groups, rootGroups));
   expandedTaskGroupKeys.value = expandedTaskGroupKeys.value.filter((key) => visibleKeys.has(key));
 });
 
@@ -1473,6 +1670,7 @@ function formatTaskCreateSkipReasons(data: any): string {
     banned: "封号",
     success: "已成功",
     active: "已有任务",
+    workspaceBlocked: "空间403",
   };
   const parts = Object.entries(labels)
     .map(([key, label]) => {
@@ -1524,6 +1722,7 @@ async function loadConfig() {
     workspaceIds: config.workspaceIds || [],
     route: config.route || "request",
     joinIntervalMs: config.joinIntervalMs || 1500,
+    poolFissionMailboxOtpCooldownMs: config.poolFissionMailboxOtpCooldownMs ?? 300000,
     taskConcurrency: config.taskConcurrency || 1,
     runWorkspaceJoin: config.runWorkspaceJoin !== false,
     runSub2Api: config.runSub2Api !== false,
@@ -1664,6 +1863,7 @@ function closeSub2apiRefillHistory() {
 async function loadTasks() {
   const data = await api<any>("/api/tasks");
   tasks.value = data.items || [];
+  workspaceBlocks.value = data.workspaceBlocks || [];
   const existing = new Set(tasks.value.map((item) => item.id));
   selectedTaskIds.value = selectedTaskIds.value.filter((id) => existing.has(id));
   if (selectedTask.value) {
@@ -1825,7 +2025,7 @@ function toggleAllEmails(event: Event) {
 
 function selectParentEmails() {
   selectedEmailIds.value = selectableParentEmails.value.map((item) => item.id);
-  showToast(`已选择母邮箱 ${selectedEmailIds.value.length} 个`);
+  showToast(`已选择可启动母号 ${selectedEmailIds.value.length} 个`);
 }
 
 async function splitSelectedEmails() {
@@ -1846,7 +2046,7 @@ async function deleteEmail(id: string, email = "") {
   const ok = window.confirm(`确认删除邮箱 ${email || id}？`);
   if (!ok) return;
   const result = await api<any>(`/api/emails/${encodeURIComponent(id)}`, {method: "DELETE"});
-  showToast(`删除完成：删除 ${result.removed ?? 0} 个${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
+  showToast(`删除完成：删除 ${result.removed ?? 0} 个${result.removedTasks ? `，同步清理任务 ${result.removedTasks} 个` : ""}${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
   selectedEmailIds.value = selectedEmailIds.value.filter((item) => item !== id);
   await refreshAll();
 }
@@ -1860,7 +2060,7 @@ async function deleteSelectedEmails() {
     body: JSON.stringify({ids: selectedEmailIds.value}),
   });
   selectedEmailIds.value = [];
-  showToast(`批量删除完成：删除 ${result.removed ?? 0} 个${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
+  showToast(`批量删除完成：删除 ${result.removed ?? 0} 个${result.removedTasks ? `，同步清理任务 ${result.removedTasks} 个` : ""}${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
   await refreshAll();
 }
 
@@ -1873,7 +2073,7 @@ async function deleteEmailsByStatus(status: "free" | "failed" | "success" | "ban
     body: JSON.stringify({status}),
   });
   selectedEmailIds.value = [];
-  showToast(`删除${label}邮箱完成：删除 ${result.removed ?? 0} 个`);
+  showToast(`删除${label}邮箱完成：删除 ${result.removed ?? 0} 个${result.removedTasks ? `，同步清理任务 ${result.removedTasks} 个` : ""}`);
   await refreshAll();
 }
 
@@ -1889,12 +2089,13 @@ async function deleteFreeChildEmails() {
   });
   const removedIds = new Set(ids);
   selectedEmailIds.value = selectedEmailIds.value.filter((id) => !removedIds.has(id));
-  showToast(`删除空闲子邮箱完成：删除 ${result.removed ?? 0} 个${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
+  showToast(`删除空闲子邮箱完成：删除 ${result.removed ?? 0} 个${result.removedTasks ? `，同步清理任务 ${result.removedTasks} 个` : ""}${result.skippedRunning ? `，跳过运行中 ${result.skippedRunning} 个` : ""}`);
   await refreshAll();
 }
 
 async function startSelectedEmailTasks() {
   const emailIds = selectedRunnableEmailIds.value;
+  const launchSummary = selectedLaunchSummary.value;
   if (!emailIds.length) {
     showToast("请选择非运行中的邮箱");
     return;
@@ -1908,6 +2109,7 @@ async function startSelectedEmailTasks() {
       count: emailIds.length,
       concurrency: form.taskConcurrency,
       workspaceIds: parseWorkspaceIds(workspaceText.value),
+      workspaceLaunchMode: workspaceLaunchMode.value,
       route: form.route,
       runWorkspaceJoin: form.runWorkspaceJoin,
       runSub2Api: form.runSub2Api,
@@ -1916,7 +2118,8 @@ async function startSelectedEmailTasks() {
     }),
   });
   selectedEmailIds.value = [];
-  showToast(`已用选中邮箱创建 ${data.tasks?.length || 0} 个任务${formatTaskCreateSkipReasons(data)}`);
+  const clientSkipText = launchSummary.skippedCount ? `，前端跳过不可启动 ${launchSummary.skippedCount} 个` : "";
+  showToast(`已用选中邮箱创建 ${data.tasks?.length || 0} 个任务${clientSkipText}${formatTaskCreateSkipReasons(data)}`);
   await refreshAll();
 }
 
@@ -1948,8 +2151,11 @@ async function checkSelectedAccessTokens() {
       if (email) email.sub2apiAccount = result.accountName;
     }
     const skipped = Number(data.skippedRunning || 0) + Number(data.missing || 0);
+    const cleaned = Number(data.prunedTasks || 0);
+    const unlinked = Number(data.clearedSub2Links || 0);
+    const cleanSuffix = cleaned || unlinked ? `，清理任务 ${cleaned}，解绑 ${unlinked}` : "";
     accessTokenCheckResult.value = [
-      `AT 检验完成：通过 ${data.ok ?? 0}，失败 ${data.failed ?? 0}${skipped ? `，跳过 ${skipped}` : ""}`,
+      `AT 检验完成：通过 ${data.ok ?? 0}，失败 ${data.failed ?? 0}${skipped ? `，跳过 ${skipped}` : ""}${cleanSuffix}`,
       ...items.slice(0, 20).map((item) => (
         `${item.ok ? "OK" : "FAIL"} ${item.email}${item.accountName ? ` (${item.accountName})` : ""}: ${item.message}`
       )),
@@ -1958,7 +2164,8 @@ async function checkSelectedAccessTokens() {
     if (items.some((item) => item.emailId && isK12RepairNeededResult(item))) {
       emailPoolFilter.value = "atRepairNeeded";
     }
-    showToast(`AT 检验完成：通过 ${data.ok ?? 0}，失败 ${data.failed ?? 0}`);
+    showToast(`AT 检验完成：通过 ${data.ok ?? 0}，失败 ${data.failed ?? 0}${cleanSuffix}`);
+    if (cleaned || unlinked) await refreshAll();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     accessTokenCheckResult.value = `AT 检验失败：${message}`;
@@ -1996,12 +2203,16 @@ async function refreshK12RepairNeededEmails() {
       const email = emails.value.find((item) => item.id === result.emailId);
       if (email) email.sub2apiAccount = result.accountName;
     }
+    const cleaned = Number(data.prunedTasks || 0);
+    const unlinked = Number(data.clearedSub2Links || 0);
+    const cleanSuffix = cleaned || unlinked ? `，清理任务 ${cleaned}，解绑 ${unlinked}` : "";
     accessTokenCheckResult.value = [
-      `K12 状态扫描完成：错误 ${items.length} 个`,
+      `K12 状态扫描完成：错误 ${items.length} 个${cleanSuffix}`,
       ...items.slice(0, 20).map((item) => `${item.email}${item.accountName ? ` (${item.accountName})` : ""}: ${item.message}`),
       items.length > 20 ? `还有 ${items.length - 20} 条未显示` : "",
     ].filter(Boolean).join("\n");
-    showToast(`K12 状态错误 ${items.length} 个`);
+    showToast(`K12 状态错误 ${items.length} 个${cleanSuffix}`);
+    if (cleaned || unlinked) await refreshAll();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     accessTokenCheckResult.value = `K12 状态扫描失败：${message}`;
@@ -2057,9 +2268,10 @@ async function startTasks() {
     const data = await api<any>("/api/tasks", {
       method: "POST",
       body: JSON.stringify({
-        count: launchTaskCount.value,
+        count: launchMotherCount.value,
         concurrency: form.taskConcurrency,
         workspaceIds: parseWorkspaceIds(workspaceText.value),
+        workspaceLaunchMode: workspaceLaunchMode.value,
         route: form.route,
         runWorkspaceJoin: form.runWorkspaceJoin,
         runSub2Api: form.runSub2Api,
@@ -2118,6 +2330,14 @@ async function cancelTask(id: string) {
   await refreshAll();
 }
 
+async function cancelTaskGroup(group: TaskSelectionGroup) {
+  const ids = activeTaskIdsOfGroup(group);
+  if (!ids.length) return;
+  await Promise.all(ids.map((id) => api(`/api/tasks/${encodeURIComponent(id)}/cancel`, {method: "POST", body: "{}"})));
+  showToast(`已取消 ${ids.length} 个运行/队列任务`);
+  await refreshAll();
+}
+
 function canDeleteTask(task: TaskItem) {
   return task.status === "failed" || task.status === "canceled";
 }
@@ -2130,7 +2350,7 @@ function isTaskGroupExpanded(key: string) {
   return expandedTaskGroupKeys.value.includes(key);
 }
 
-function toggleTaskGroup(group: TaskTableGroup) {
+function toggleTaskGroup(group: TaskSelectionGroup) {
   expandedTaskGroupKeys.value = isTaskGroupExpanded(group.key)
     ? expandedTaskGroupKeys.value.filter((key) => key !== group.key)
     : [...expandedTaskGroupKeys.value, group.key];
@@ -2144,15 +2364,15 @@ function openOrToggleTaskGroup(group: TaskTableGroup) {
   openTaskLog(group.primaryTask);
 }
 
-function isTaskGroupFullySelected(group: TaskTableGroup) {
+function isTaskGroupFullySelected(group: TaskSelectionGroup) {
   return group.tasks.length > 0 && group.tasks.every((task) => selectedTaskIds.value.includes(task.id));
 }
 
-function isTaskGroupPartlySelected(group: TaskTableGroup) {
+function isTaskGroupPartlySelected(group: TaskSelectionGroup) {
   return group.tasks.some((task) => selectedTaskIds.value.includes(task.id));
 }
 
-function toggleTaskGroupSelection(group: TaskTableGroup) {
+function toggleTaskGroupSelection(group: TaskSelectionGroup) {
   const ids = group.tasks.map((task) => task.id);
   const selected = new Set(selectedTaskIds.value);
   if (ids.every((id) => selected.has(id))) {
@@ -2163,8 +2383,109 @@ function toggleTaskGroupSelection(group: TaskTableGroup) {
   selectedTaskIds.value = Array.from(selected);
 }
 
-function taskGroupHasSelectedTask(group: TaskTableGroup) {
+function taskGroupHasSelectedTask(group: TaskSelectionGroup) {
   return Boolean(selectedTask.value && group.tasks.some((task) => task.id === selectedTask.value?.id));
+}
+
+function workspaceLabel(group: TaskTableGroup) {
+  const [workspaceId] = group.workspaceIds;
+  if (!workspaceId) return "无 workspace";
+  return `${workspaceId.slice(0, 8)}...`;
+}
+
+function normalizeKey(value: unknown) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function rootEmailOfTask(task: TaskItem) {
+  const email = normalizeKey(task.rootEmail || task.parentEmail || task.smsBowerMailRoot || task.email);
+  const at = email.indexOf("@");
+  if (at <= 0) return email;
+  const local = email.slice(0, at);
+  const plus = local.indexOf("+");
+  return plus >= 0 ? `${local.slice(0, plus)}${email.slice(at)}` : email;
+}
+
+function workspaceKeyOfIds(workspaceIds?: string[]) {
+  return normalizeKey((workspaceIds || []).find(Boolean));
+}
+
+function workspaceBlockForEmail(email: string, workspaceIds?: string[]) {
+  const identity = normalizeKey(email);
+  const workspaceId = workspaceKeyOfIds(workspaceIds);
+  if (!identity || !workspaceId) return undefined;
+  return workspaceBlocks.value.find((item) => (
+    item.scope === "email"
+    && normalizeKey(item.rootEmail) === identity
+    && normalizeKey(item.workspaceId) === workspaceId
+  ));
+}
+
+function uniqueWorkspaceBlocks(blocks: WorkspaceBlockItem[]) {
+  const seen = new Set<string>();
+  return blocks.filter((item) => {
+    const key = `${normalizeKey(item.rootEmail)}|${normalizeKey(item.workspaceId)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function workspaceBlocksForTasks(tasks: TaskItem[], workspaceIds?: string[]) {
+  const emails = new Set(tasks.map((task) => normalizeKey(task.email)).filter(Boolean));
+  const workspaceFilter = new Set((workspaceIds || []).map(normalizeKey).filter(Boolean));
+  return uniqueWorkspaceBlocks(workspaceBlocks.value.filter((item) => (
+    item.scope === "email"
+    && emails.has(normalizeKey(item.rootEmail))
+    && (!workspaceFilter.size || workspaceFilter.has(normalizeKey(item.workspaceId)))
+  )));
+}
+
+function workspaceBlockTitle(blocks: WorkspaceBlockItem[]) {
+  return blocks
+    .map((item) => `${item.rootEmail} / ${item.workspaceId.slice(0, 8)}: ${item.reason || "403 workspace access denied"}`)
+    .join("\n");
+}
+
+function taskStateDetailText(task: TaskItem) {
+  return [
+    task.workspaceBlockReason || "",
+    task.accessTokenLivenessMessage || "",
+    task.error || "",
+    ...(task.logs || []).map((log) => log.message || ""),
+  ].filter(Boolean).join("\n");
+}
+
+function tasksStateDetailText(tasks: TaskItem[]) {
+  return tasks.map(taskStateDetailText).filter(Boolean).join("\n");
+}
+
+function workspaceState(group: TaskTableGroup) {
+  const blocks = workspaceBlocksForTasks(group.tasks, group.workspaceIds);
+  if (blocks.length) {
+    return {
+      kind: "partial",
+      text: `死号 ${blocks.length}`,
+      title: workspaceBlockTitle(blocks),
+    };
+  }
+  return workspaceStateFromTask(group.status, tasksStateDetailText(group.tasks));
+}
+
+function taskWorkspaceState(task: TaskItem) {
+  const block = workspaceBlockForEmail(task.email, task.workspaceIds);
+  if (block || task.workspaceBlocked) {
+    return {
+      kind: "dead",
+      text: "该号403",
+      title: block?.reason || task.workspaceBlockReason || "该邮箱在这个 workspace 被 403 拒绝访问",
+    };
+  }
+  return workspaceStateFromTask(task.status, taskStateDetailText(task));
+}
+
+function rootWorkspaceState(group: TaskTableRootGroup) {
+  return workspaceStateFromRootGroup(group.status, tasksStateDetailText(group.tasks));
 }
 
 function canTopUpFission(group: TaskTableGroup) {
@@ -2195,6 +2516,7 @@ async function requestFissionTopUp(group: TaskTableGroup) {
     body: JSON.stringify({
       rootEmail: group.rootEmail,
       targetSuccesses: group.fissionTargetChildren,
+      workspaceIds: group.workspaceIds,
     }),
   });
 }
@@ -2393,6 +2715,27 @@ async function retryFailedTasks() {
     showToast(`重跑失败任务失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     retryingFailedTasks.value = false;
+  }
+}
+
+async function cancelActiveTasks() {
+  if (!activeTaskCount.value || stoppingActiveTasks.value) return;
+  const ok = window.confirm(`确认停止全部 ${activeTaskCount.value} 个运行/队列任务？`);
+  if (!ok) return;
+  stoppingActiveTasks.value = true;
+  try {
+    const result = await api<any>("/api/tasks/cancel-active", {method: "POST", body: "{}"});
+    selectedTaskIds.value = [];
+    if (selectedTask.value?.status === "queued" || selectedTask.value?.status === "running") {
+      selectedTask.value = null;
+      showTaskLogModal.value = false;
+    }
+    showToast(`已停止 ${result.canceled ?? 0} 个任务`);
+    await refreshAll();
+  } catch (error) {
+    showToast(`停止任务失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    stoppingActiveTasks.value = false;
   }
 }
 

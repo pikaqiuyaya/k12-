@@ -8,3 +8,4 @@ pool_tokens.txt
 auth/
 **/._*
 *.bak.*
+.codex-run-logs/

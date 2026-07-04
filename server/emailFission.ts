@@ -2,6 +2,7 @@ type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
 type EmailStatus = "free" | "running" | "success" | "failed" | "banned";
 type TaskKind = "k12" | "at-repair";
 type EmailOtpMode = "auto" | "manual" | "smsbower-mail" | "emailnator";
+export type WorkspaceLaunchMode = "all" | "random-one";
 
 export interface PoolFissionNewTaskInput {
   enabled: boolean;
@@ -70,14 +71,52 @@ export type TaskCreationSkipReason = "running" | "banned" | "success" | "active"
 export interface TaskCreationSkipInput {
   emailStatus: EmailStatus;
   hasActiveTask: boolean;
+  hasPriorSuccess?: boolean;
 }
 
 export function taskCreationSkipReason(input: TaskCreationSkipInput): TaskCreationSkipReason | undefined {
-  if (input.emailStatus === "running") return "running";
-  if (input.emailStatus === "banned") return "banned";
-  if (input.emailStatus === "success") return "success";
   if (input.hasActiveTask) return "active";
+  if (input.hasPriorSuccess) return "success";
   return undefined;
+}
+
+export function shouldAutoSelectEmailForK12Launch(input: {emailStatus: EmailStatus; isChildEmail: boolean}): boolean {
+  if (input.isChildEmail) return false;
+  return input.emailStatus !== "running";
+}
+
+export function normalizeWorkspaceLaunchMode(value: unknown): WorkspaceLaunchMode {
+  return value === "random-one" ? "random-one" : "all";
+}
+
+export function workspaceTaskVariantsForLaunch(input: {
+  workspaceCandidates: string[];
+  workspaceLaunchMode?: WorkspaceLaunchMode;
+  randomIndex?: number;
+}): string[] {
+  const candidates = input.workspaceCandidates
+    .map((item) => String(item || "").trim())
+    .filter((item, index, values) => index === values.findIndex((value) => value.toLowerCase() === item.toLowerCase()));
+  const variants = candidates.length ? candidates : [""];
+  if (input.workspaceLaunchMode !== "random-one") return variants;
+  const index = Math.abs(Math.floor(Number(input.randomIndex) || 0)) % variants.length;
+  return [variants[index]];
+}
+
+export function taskWorkspaceKey(workspaceIds: string[] | undefined): string {
+  const [first] = (workspaceIds || []).map((item) => String(item || "").trim()).filter(Boolean);
+  return first ? first.toLowerCase() : "__no_workspace__";
+}
+
+export function taskWorkspaceKeysOverlap(left: string[] | undefined, right: string[] | undefined): boolean {
+  return taskWorkspaceKey(left) === taskWorkspaceKey(right);
+}
+
+export function taskWorkspaceAllowed(taskWorkspaceIds: string[] | undefined, configuredWorkspaceIds: string[] | undefined): boolean {
+  const configured = new Set((configuredWorkspaceIds || []).map((item) => String(item || "").trim().toLowerCase()).filter(Boolean));
+  if (!configured.size) return true;
+  const key = taskWorkspaceKey(taskWorkspaceIds);
+  return key === "__no_workspace__" || configured.has(key);
 }
 
 export interface DuplicateQueuedTaskInput {
@@ -88,6 +127,14 @@ export interface DuplicateQueuedTaskInput {
 
 export function shouldSkipDuplicateQueuedTask(input: DuplicateQueuedTaskInput): boolean {
   return input.taskKind === "k12" && input.taskStatus === "queued" && input.hasPriorSuccess;
+}
+
+export function taskStatusAfterCancelRequest(status: TaskStatus): TaskStatus {
+  return status === "queued" || status === "running" ? "canceled" : status;
+}
+
+export function shouldCancelActiveTaskStatus(status: TaskStatus): boolean {
+  return status === "queued" || status === "running";
 }
 
 export interface SmsBowerActivationInput {
@@ -138,9 +185,73 @@ export function isSmsBowerNoCodeTimeoutMessage(value: unknown): boolean {
   return /SMSBower 邮箱中未找到验证码|Code has not been received yet|code has not been received|no code|验证码.*未收到|未找到验证码/i.test(message);
 }
 
+export function isMailboxAccountInvalidMessage(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : String(value || "");
+  return /mailbox\s+dead|email account is invalid|mailbox account is invalid|invalid mailbox account|邮箱账号无效|邮箱账户无效|邮箱不可用/i.test(message);
+}
+
+export function isMailboxBaselineCodeTimeoutMessage(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : String(value || "");
+  return /mailbox code timeout:\s*mailbox still returns baseline code|still returns baseline code/i.test(message);
+}
+
+export function isMailboxOtpDeliveryTimeoutMessage(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : String(value || "");
+  return /mailbox code timeout:\s*(mailbox still returns baseline code|mailbox returned no code)|still returns baseline code/i.test(message);
+}
+
 export function isOpenAiUserAlreadyExistsMessage(value: unknown): boolean {
   const message = value instanceof Error ? value.message : String(value || "");
   return /user_already_exists|An account already exists for this email address|please login instead/i.test(message);
+}
+
+export function shouldStopPoolFissionAfterUserAlreadyExists(input: {
+  isSmsBowerMail: boolean;
+  userAlreadyExists: boolean;
+  successfulChildren: number;
+  accountExistsFailures: number;
+}): boolean {
+  return false;
+}
+
+export function shouldStopPoolFissionAfterMailboxOtpTimeout(input: {
+  isSmsBowerMail: boolean;
+  isChildEmail: boolean;
+  mailboxOtpDeliveryTimeout: boolean;
+}): boolean {
+  return false;
+}
+
+export function shouldCooldownPoolFissionAfterMailboxOtpTimeout(input: {
+  isSmsBowerMail: boolean;
+  isChildEmail: boolean;
+  mailboxOtpDeliveryTimeout: boolean;
+}): boolean {
+  return input.mailboxOtpDeliveryTimeout && !input.isSmsBowerMail && input.isChildEmail;
+}
+
+export function shouldCooldownPoolFissionAfterUserAlreadyExists(input: {
+  isSmsBowerMail: boolean;
+  isChildEmail: boolean;
+  userAlreadyExists: boolean;
+}): boolean {
+  return input.userAlreadyExists && !input.isSmsBowerMail && input.isChildEmail;
+}
+
+export function shouldTreatPoolChildUserAlreadyExistsAsLimitSuccess(input: {
+  isSmsBowerMail: boolean;
+  isChildEmail: boolean;
+  userAlreadyExists: boolean;
+}): boolean {
+  return false;
+}
+
+export function shouldMarkPoolRootUnusableAfterUserAlreadyExists(input: {
+  isSmsBowerMail: boolean;
+  isChildEmail: boolean;
+  userAlreadyExists: boolean;
+}): boolean {
+  return input.userAlreadyExists && !input.isSmsBowerMail && !input.isChildEmail;
 }
 
 export function shouldAutoReplaceSmsBowerMailFailure(input: SmsBowerAutoReplaceInput): boolean {
@@ -158,15 +269,36 @@ export function shouldRequestSmsBowerNextCodeBeforeWait(input: {retryAfterWrongO
   return input.retryAfterWrongOtp === true;
 }
 
+export function shouldSendLoginOtpBeforeEmailVerification(input: {otpSentInFlow?: boolean}): boolean {
+  return input.otpSentInFlow !== true;
+}
+
+export function loginOtpSendSuccessMessage(nextUrl: string): string {
+  const normalized = String(nextUrl || "").trim();
+  if (normalized === "https://auth.openai.com/email-verification") {
+    return "登录验证码发送请求成功，继续等待邮箱新验证码";
+  }
+  return `登录验证码发送请求成功，下一步: ${normalized || "unknown"}`;
+}
+
+export function loginOtpSendFailureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || "unknown");
+  return `登录验证码发送请求失败，停止等待验证码: ${message}`;
+}
+
+export function shouldResendLoginOtpAfterWrongCode(_input: {otpMode?: EmailOtpMode}): boolean {
+  return true;
+}
+
 export function mailboxOtpWaitOptions(input: {retryAfterWrongOtp?: boolean}): {
   timeoutMs: number;
   intervalMs: number;
   allowBaselineCodeAfterMs: number;
 } {
   return {
-    timeoutMs: 120000,
+    timeoutMs: input.retryAfterWrongOtp ? 45000 : 120000,
     intervalMs: 3000,
-    allowBaselineCodeAfterMs: input.retryAfterWrongOtp ? 0 : 45000,
+    allowBaselineCodeAfterMs: 0,
   };
 }
 

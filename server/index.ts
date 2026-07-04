@@ -11,11 +11,16 @@ import {
   isRecoverableWorkspaceSwitchAuthStep,
   isRecoverableWorkspaceSelectError,
   isSameDomainWorkspaceError,
+  isUnavailableWorkspaceSelectError,
   mergeWorkspaceFallbackIds,
+  removeWorkspaceId,
   shouldRetryK12Invite,
 } from "./k12Workspace";
 import {
   isGoogleSsoUnsupportedMessage,
+  isMailboxBaselineCodeTimeoutMessage,
+  isMailboxAccountInvalidMessage,
+  isMailboxOtpDeliveryTimeoutMessage,
   isOpenAiUserAlreadyExistsMessage,
   isSmsBowerCodeLimitReachedMessage,
   isSmsBowerActivationCanceledMessage,
@@ -24,16 +29,31 @@ import {
   fissionTopUpBlockReason,
   fissionTopUpRemainingAfterThis,
   hasSmsBowerFissionHistory,
+  loginOtpSendFailureMessage,
+  loginOtpSendSuccessMessage,
   mailboxOtpWaitOptions,
   poolFissionRemainingForNextTask,
   poolFissionRemainingForNewTask,
   shouldEnqueueSmsBowerBatchReplacement,
   shouldAutoReplaceSmsBowerMailFailure,
+  shouldAutoSelectEmailForK12Launch,
+  shouldCancelActiveTaskStatus,
+  shouldCooldownPoolFissionAfterMailboxOtpTimeout,
+  shouldCooldownPoolFissionAfterUserAlreadyExists,
   shouldCreatePoolFissionChild,
+  shouldResendLoginOtpAfterWrongCode,
   shouldRequestSmsBowerNextCodeBeforeWait,
+  shouldSendLoginOtpBeforeEmailVerification,
   shouldSkipDuplicateQueuedTask,
+  shouldMarkPoolRootUnusableAfterUserAlreadyExists,
   smsBowerActivationBlockReason,
+  normalizeWorkspaceLaunchMode,
   taskCreationSkipReason,
+  taskStatusAfterCancelRequest,
+  taskWorkspaceAllowed,
+  workspaceTaskVariantsForLaunch,
+  taskWorkspaceKey,
+  taskWorkspaceKeysOverlap,
 } from "./emailFission";
 import {createSub2ApiAdminLoginManager} from "./sub2ApiAdminAuth";
 import {shouldFailTaskAfterServerRestart} from "./taskRestart";
@@ -41,19 +61,34 @@ import {
   K12_PLAN_MISMATCH_ISSUE,
   SUB2API_K12_STATUS_ERROR_ISSUE,
   isAutoAtRepairIssue,
+  isTerminalK12AccessDeniedMessage,
   shouldCreateAutoAtRepairTask,
   sub2ApiAccountEmailCandidatesFromName,
+  sub2ApiK12LivenessIssue,
   sub2ApiK12StatusErrorReason,
   type K12RepairIssue,
 } from "./sub2ApiAccountRepair";
 import {
   combineDirectAndSub2Liveness,
+  isOpenAiWorkspaceAccessDeniedMessage,
   k12PlanMismatchReason,
   shouldTrySub2LivenessAfterDirectFailure,
   type AccessTokenLivenessResult,
 } from "./accessTokenLiveness";
 import {isMissingChatGptAccessTokenError} from "./chatGptSession";
-import {poolFissionCooldownDelayMs} from "./poolFissionCooldown";
+import {
+  DEFAULT_POOL_FISSION_CHILD_COOLDOWN_MS,
+  DEFAULT_POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS,
+  poolFissionCooldownDelayMs,
+  poolFissionMailboxOtpCooldownDelayMs,
+} from "./poolFissionCooldown";
+import {pruneTasksForDeletedEmails, pruneTasksForMissingSub2ApiAccounts, pruneTasksWithoutEmailRecords} from "./emailDeletion";
+import {writeJsonAtomic} from "./atomicJson";
+import {
+  emailWorkspaceBlockReason,
+  upsertWorkspaceBlock,
+  type WorkspaceBlockRecord,
+} from "./workspaceBlocklist";
 
 type K12Route = "request" | "accept";
 type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
@@ -101,6 +136,7 @@ interface AppConfig {
   smsBowerMailMaxPrice: string;
   smsBowerGmailFissionEnabled: boolean;
   smsBowerGmailFissionCount: number;
+  poolFissionMailboxOtpCooldownMs: number;
   emailnatorBaseUrl: string;
   emailnatorEmailType: string;
   requireChatgptAccountId: boolean;
@@ -190,6 +226,7 @@ interface K12Task {
   updatedAt: string;
   startedAt?: string;
   finishedAt?: string;
+  notBefore?: string;
   cancelRequested?: boolean;
   error?: string;
   accessToken?: string;
@@ -252,6 +289,8 @@ interface Sub2ApiRefillResult {
   createdTasks: number;
   skippedRunning: number;
   missing: number;
+  prunedTasks?: number;
+  clearedSub2Links?: number;
   message: string;
   samples: string[];
 }
@@ -276,6 +315,9 @@ interface Sub2ApiAutoAtRepairResult {
   createdTasks: number;
   skippedRunning: number;
   skippedUnmatched: number;
+  skippedTerminal: number;
+  prunedTasks?: number;
+  clearedSub2Links?: number;
   message: string;
   samples: string[];
 }
@@ -288,6 +330,7 @@ const configFile = path.join(dataDir, "config.json");
 const emailsFile = path.join(dataDir, "emails.json");
 const tasksFile = path.join(dataDir, "tasks.json");
 const sub2apiRefillHistoryFile = path.join(dataDir, "sub2api-refill-history.json");
+const workspaceBlocksFile = path.join(dataDir, "workspace-blocks.json");
 const compatConfigFile = path.join(rootDir, "config.json");
 const defaultJsonOutDir = path.join(rootDir, "json");
 
@@ -313,8 +356,8 @@ const DEFAULT_SMSBOWER_HANDLER_URL = "https://smsbower.page/stubs/handler_api.ph
 const DEFAULT_EMAILNATOR_BASE_URL = "https://www.emailnator.com";
 const DEFAULT_SMSBOWER_AUTO_REPLACEMENT_LIMIT = 1;
 const SMSBOWER_CODE_MAX_ATTEMPTS = 30;
-const POOL_FISSION_CHILD_COOLDOWN_MS = 30_000;
-const POOL_FISSION_ACCOUNT_EXISTS_STOP_THRESHOLD = 3;
+const POOL_FISSION_CHILD_COOLDOWN_MS = DEFAULT_POOL_FISSION_CHILD_COOLDOWN_MS;
+const POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS = DEFAULT_POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS;
 const K12_WORKSPACE_SWITCH_TOKEN_RETRIES = 6;
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
@@ -324,9 +367,11 @@ let appConfig: AppConfig;
 let emails: EmailRecord[] = [];
 let tasks: K12Task[] = [];
 let sub2apiRefillHistory: Sub2ApiRefillHistoryEntry[] = [];
+let workspaceBlocks: WorkspaceBlockRecord[] = [];
 let activeWorkers = 0;
 const manualOtpWaiters = new Map<string, {resolve: (code: string) => void; reject: (error: Error) => void; expiresAt: number}>();
 let sub2apiRefillTimer: ReturnType<typeof setInterval> | undefined;
+let taskScheduleTimer: ReturnType<typeof setTimeout> | undefined;
 let sub2apiRefillRunning = false;
 let sub2apiRefillLastCheckedAt = "";
 let sub2apiRefillNextCheckAt = "";
@@ -484,8 +529,7 @@ async function readJson<T>(filePath: string, fallback: T): Promise<T> {
 }
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
-  await mkdir(path.dirname(filePath), {recursive: true});
-  await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await writeJsonAtomic(filePath, value);
 }
 
 function buildDownloadFetchOptions(): {dispatcher?: ProxyAgent} {
@@ -569,6 +613,7 @@ async function defaultConfig(): Promise<AppConfig> {
     smsBowerMailMaxPrice: "",
     smsBowerGmailFissionEnabled: false,
     smsBowerGmailFissionCount: 1,
+    poolFissionMailboxOtpCooldownMs: DEFAULT_POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS,
     emailnatorBaseUrl: DEFAULT_EMAILNATOR_BASE_URL,
     emailnatorEmailType: "plusGmail",
     requireChatgptAccountId: true,
@@ -591,8 +636,9 @@ async function loadConfig(): Promise<AppConfig> {
 }
 
 function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
-  const workspaceIds = parseStringList(raw.workspaceIds).length
-    ? parseStringList(raw.workspaceIds)
+  const parsedWorkspaceIds = parseStringList(raw.workspaceIds);
+  const workspaceIds = Object.prototype.hasOwnProperty.call(raw, "workspaceIds")
+    ? parsedWorkspaceIds
     : [DEFAULT_WORKSPACE_ID];
   const route = raw.route === "accept" ? "accept" : "request";
   return {
@@ -633,6 +679,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     smsBowerMailMaxPrice: asString(raw.smsBowerMailMaxPrice),
     smsBowerGmailFissionEnabled: asBoolean(raw.smsBowerGmailFissionEnabled, false),
     smsBowerGmailFissionCount: asNumber(raw.smsBowerGmailFissionCount, 1, 1, 100),
+    poolFissionMailboxOtpCooldownMs: asNumber(raw.poolFissionMailboxOtpCooldownMs, DEFAULT_POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS, 0, 60 * 60 * 1000),
     emailnatorBaseUrl: normalizeEmailnatorBaseUrl(raw.emailnatorBaseUrl),
     emailnatorEmailType: normalizeEmailnatorEmailType(raw.emailnatorEmailType),
     requireChatgptAccountId: asBoolean(raw.requireChatgptAccountId, true),
@@ -647,6 +694,62 @@ async function saveConfig(next: AppConfig): Promise<void> {
   await writeJson(configFile, appConfig);
   await ensureCompatBundleConfig();
   configureSub2ApiRefillTimer();
+}
+
+async function removeUnavailableWorkspaceIdFromState(workspaceId: string, reason: string, currentTask?: K12Task): Promise<void> {
+  const trimmed = workspaceId.trim();
+  if (!trimmed) return;
+
+  const previousConfigIds = appConfig.workspaceIds;
+  const nextConfigIds = removeWorkspaceId(previousConfigIds, trimmed);
+  const configChanged = nextConfigIds.length !== previousConfigIds.length;
+  if (configChanged) {
+    await saveConfig({...appConfig, workspaceIds: nextConfigIds});
+  }
+
+  let tasksChanged = false;
+  const replacementIds = nextConfigIds;
+  for (const task of tasks) {
+    if (task.status !== "queued" && task.id !== currentTask?.id) continue;
+    const nextTaskIds = removeWorkspaceId(task.workspaceIds, trimmed);
+    if (nextTaskIds.length === task.workspaceIds.length) continue;
+    task.workspaceIds = nextTaskIds.length ? nextTaskIds : replacementIds;
+    task.updatedAt = nowIso();
+    appendLog(task, "warn", `workspace ${trimmed.slice(0, 8)}... 不可用，已从任务候选删除: ${reason}`);
+    if (!task.workspaceIds.length && task.status === "queued" && task.runWorkspaceJoin) {
+      task.status = "failed";
+      task.error = "没有可用 K12 workspace id，任务已停止";
+      task.finishedAt = nowIso();
+      appendLog(task, "error", task.error);
+    }
+    tasksChanged = true;
+  }
+
+  if (currentTask && configChanged) {
+    appendLog(currentTask, "warn", `workspace ${trimmed.slice(0, 8)}... 不可用，已从全局配置删除`);
+  }
+  if (tasksChanged) await persistTasks();
+}
+
+function cancelTasksOutsideConfiguredWorkspaces(reason: string, configuredWorkspaceIds = appConfig.workspaceIds): number {
+  let canceled = 0;
+  for (const task of tasks) {
+    if (task.status !== "queued" && task.status !== "running") continue;
+    if (taskWorkspaceAllowed(task.workspaceIds, configuredWorkspaceIds)) continue;
+    task.cancelRequested = true;
+    task.status = "canceled";
+    task.error = reason;
+    task.finishedAt = nowIso();
+    task.updatedAt = nowIso();
+    task.waitingOtp = false;
+    task.waitingOtpLabel = undefined;
+    task.waitingOtpEmail = undefined;
+    task.waitingOtpSince = undefined;
+    cancelManualEmailOtp(task.id, reason);
+    appendLog(task, "warn", reason);
+    canceled += 1;
+  }
+  return canceled;
 }
 
 async function ensureCompatBundleConfig(): Promise<void> {
@@ -682,6 +785,7 @@ async function ensureCompatBundleConfig(): Promise<void> {
     smsBowerMailMaxPrice: appConfig.smsBowerMailMaxPrice,
     smsBowerGmailFissionEnabled: appConfig.smsBowerGmailFissionEnabled,
     smsBowerGmailFissionCount: appConfig.smsBowerGmailFissionCount,
+    poolFissionMailboxOtpCooldownMs: appConfig.poolFissionMailboxOtpCooldownMs,
     emailnatorBaseUrl: appConfig.emailnatorBaseUrl,
     emailnatorEmailType: appConfig.emailnatorEmailType,
     jsonOutDir: appConfig.jsonOutDir,
@@ -1680,12 +1784,37 @@ async function enqueueNextPoolFissionTask(email: EmailRecord, task: K12Task): Pr
   }
   const parent = findPoolFissionParent(email);
   const root = rootMailboxIdentity(parent);
-  if (task.status === "failed" && isOpenAiUserAlreadyExistsMessage(task.error) && shouldStopPoolFissionForAccountExists(root)) {
-    parent.smsBowerFissionChildrenRemaining = 0;
-    parent.updatedAt = nowIso();
-    appendLog(task, "warn", `同母邮箱 ${root} 已有多个子号返回 user_already_exists，停止继续补分裂，当前成功子号 ${successfulFissionChildrenForRoot(root)}`);
+  if (shouldCooldownPoolFissionAfterMailboxOtpTimeout({
+    isSmsBowerMail: email.otpMode === "smsbower-mail",
+    isChildEmail: Boolean(email.parentEmail),
+    mailboxOtpDeliveryTimeout: isMailboxOtpDeliveryTimeoutMessage(task.error),
+  })) {
+    const notBefore = markPoolFissionMailboxOtpCooldown(parent, root, task, appConfig.poolFissionMailboxOtpCooldownMs);
+    const nextRemaining = poolFissionRemainingForNextTask({status: task.status, remaining});
+    const delayedTask = enqueuePoolFissionChildTask(parent, task, task.workspaceIds, nextRemaining, notBefore);
+    const workspaceText = task.workspaceIds[0] ? ` workspace=${task.workspaceIds[0]}` : "";
+    appendLog(task, "warn", `已排队冷却后继续补分裂${workspaceText}: ${delayedTask.email}，notBefore=${notBefore}`);
+    appendLog(delayedTask, "info", `由邮箱 ${email.email} 收码冷却后创建，母邮箱 ${parent.email}${workspaceText}，5 分钟后自动继续`);
     await Promise.all([persistTasks(), persistEmails()]);
-    return undefined;
+    const rotatedTask = await enqueueNextAvailablePoolFissionWorkspace(parent, root, task, task.workspaceIds);
+    scheduleTasks();
+    return rotatedTask || delayedTask;
+  }
+  if (shouldCooldownPoolFissionAfterUserAlreadyExists({
+    isSmsBowerMail: email.otpMode === "smsbower-mail",
+    isChildEmail: Boolean(email.parentEmail),
+    userAlreadyExists: task.status === "failed" && isOpenAiUserAlreadyExistsMessage(task.error),
+  })) {
+    const notBefore = markPoolFissionUserAlreadyExistsCooldown(parent, root, task, appConfig.poolFissionMailboxOtpCooldownMs);
+    const nextRemaining = poolFissionRemainingForNextTask({status: task.status, remaining});
+    const delayedTask = enqueuePoolFissionChildTask(parent, task, task.workspaceIds, nextRemaining, notBefore);
+    const workspaceText = task.workspaceIds[0] ? ` workspace=${task.workspaceIds[0]}` : "";
+    appendLog(task, "warn", `已排队 400 冷却后继续补分裂${workspaceText}: ${delayedTask.email}，notBefore=${notBefore}`);
+    appendLog(delayedTask, "info", `由邮箱 ${email.email} 400 冷却后创建，母邮箱 ${parent.email}${workspaceText}，冷却后自动继续`);
+    await Promise.all([persistTasks(), persistEmails()]);
+    const rotatedTask = await enqueueNextAvailablePoolFissionWorkspace(parent, root, task, task.workspaceIds);
+    scheduleTasks();
+    return rotatedTask || delayedTask;
   }
   const child = createPoolFissionChild(parent);
   const nextRemaining = poolFissionRemainingForNextTask({status: task.status, remaining});
@@ -1845,6 +1974,10 @@ async function persistSub2ApiRefillHistory(): Promise<void> {
   await writeJson(sub2apiRefillHistoryFile, sub2apiRefillHistory.slice(0, 200));
 }
 
+async function persistWorkspaceBlocks(): Promise<void> {
+  await writeJson(workspaceBlocksFile, workspaceBlocks);
+}
+
 function hasRunningOrQueuedTasks(items = tasks): boolean {
   return items.some((task) => task.status === "queued" || task.status === "running");
 }
@@ -1952,6 +2085,7 @@ function normalizeImportedTask(value: unknown): K12Task | null {
     updatedAt: asString(record.updatedAt) || nowIso(),
     startedAt: asString(record.startedAt) || undefined,
     finishedAt: asString(record.finishedAt) || undefined,
+    notBefore: asString(record.notBefore) || undefined,
     cancelRequested: asBoolean(record.cancelRequested, false) || undefined,
     error: asString(record.error) || undefined,
     accessToken: String(record.accessToken || ""),
@@ -2094,21 +2228,34 @@ async function importEmails(
   return {added, updated, skipped, invalid, inputLines: lines.length, total: emails.length, invalidSamples};
 }
 
-function hasActiveTask(emailId: string): boolean {
-  return tasks.some((task) => task.emailId === emailId && (task.status === "queued" || task.status === "running"));
+function hasActiveTask(emailId: string, workspaceIds?: string[]): boolean {
+  return tasks.some((task) => (
+    task.emailId === emailId
+    && (task.status === "queued" || task.status === "running")
+    && (workspaceIds === undefined || taskWorkspaceKeysOverlap(task.workspaceIds, workspaceIds))
+  ));
 }
 
-function hasPriorSuccessfulK12Task(emailId: string, exceptTaskId: string): boolean {
-  return tasks.some((task) => task.id !== exceptTaskId && task.emailId === emailId && task.kind === "k12" && task.status === "success");
+function hasPriorSuccessfulK12Task(emailId: string, exceptTaskId: string, workspaceIds?: string[]): boolean {
+  return tasks.some((task) => (
+    task.id !== exceptTaskId
+    && task.emailId === emailId
+    && task.kind === "k12"
+    && task.status === "success"
+    && (workspaceIds === undefined || taskWorkspaceKeysOverlap(task.workspaceIds, workspaceIds))
+  ));
 }
 
-function removeEmails(ids: string[]): {removed: number; skippedRunning: number; missing: number} {
+function removeEmails(ids: string[]): {removed: number; removedTasks: number; skippedRunning: number; missing: number} {
   const requested = new Set(ids.filter(Boolean));
-  if (!requested.size) return {removed: 0, skippedRunning: 0, missing: 0};
+  if (!requested.size) return {removed: 0, removedTasks: 0, skippedRunning: 0, missing: 0};
 
   let removed = 0;
+  let removedTasks = 0;
   let skippedRunning = 0;
   let missing = 0;
+  const originalEmails = emails;
+  const removedEmailIds: string[] = [];
   const existingIds = new Set(emails.map((item) => item.id));
   for (const id of requested) {
     if (!existingIds.has(id)) missing += 1;
@@ -2121,14 +2268,31 @@ function removeEmails(ids: string[]): {removed: number; skippedRunning: number; 
       return true;
     }
     removed += 1;
+    removedEmailIds.push(email.id);
     return false;
   });
 
-  return {removed, skippedRunning, missing};
+  if (removedEmailIds.length) {
+    const pruned = pruneTasksForDeletedEmails(originalEmails, tasks, removedEmailIds);
+    tasks = pruned.tasks;
+    removedTasks = pruned.removedTasks;
+  }
+
+  return {removed, removedTasks, skippedRunning, missing};
 }
 
 function rootMailboxIdentity(email: EmailRecord): string {
   return (email.parentEmail || email.email).toLowerCase();
+}
+
+function rootMailboxIdentityFromAddress(address: string): string {
+  const email = address.trim().toLowerCase();
+  const at = email.indexOf("@");
+  if (at <= 0) return email;
+  const local = email.slice(0, at);
+  const domain = email.slice(at);
+  const plus = local.indexOf("+");
+  return plus >= 0 ? `${local.slice(0, plus)}${domain}` : email;
 }
 
 function rootMailboxIdentityByEmailId(emailId: string): string {
@@ -2136,65 +2300,318 @@ function rootMailboxIdentityByEmailId(emailId: string): string {
   return email ? rootMailboxIdentity(email) : emailId;
 }
 
-function relatedK12TasksForRoot(root: string): K12Task[] {
-  return tasks.filter((task) => (task.kind || "k12") === "k12" && rootMailboxIdentityByEmailId(task.emailId) === root);
+function exactWorkspaceBlockReason(email: string, workspaceIds?: string[]): string {
+  return emailWorkspaceBlockReason(workspaceBlocks, email, workspaceIds);
+}
+
+function recordEmailWorkspaceBlock(input: {
+  email: string;
+  workspaceIds?: string[];
+  reason: string;
+  source: string;
+  accountName?: string;
+}): {changed: boolean; blocked: number} {
+  const ids = uniqueStringList(input.workspaceIds || []);
+  let changed = false;
+  let blocked = 0;
+  for (const workspaceId of ids) {
+    const result = upsertWorkspaceBlock(workspaceBlocks, {
+      rootEmail: input.email,
+      workspaceId,
+      reason: input.reason,
+      at: nowIso(),
+      scope: "email",
+      source: input.source,
+      accountName: input.accountName,
+    });
+    workspaceBlocks = result.blocks;
+    changed = changed || result.changed;
+    blocked += 1;
+  }
+  return {changed, blocked};
+}
+
+async function blockEmailWorkspace(input: {
+  email: string;
+  workspaceIds?: string[];
+  reason: string;
+  source: string;
+  accountName?: string;
+}): Promise<{blocked: number}> {
+  const blocked = recordEmailWorkspaceBlock(input);
+  if (blocked.changed) await persistWorkspaceBlocks();
+  return {blocked: blocked.blocked};
+}
+
+function restoreWorkspaceAccessDeniedEmailStatuses(): boolean {
+  let changed = false;
+  for (const email of emails) {
+    if (email.status !== "banned") continue;
+    if (!isOpenAiWorkspaceAccessDeniedMessage(email.lastError)) continue;
+    email.status = "free";
+    email.lastError = "";
+    email.updatedAt = nowIso();
+    changed = true;
+  }
+  return changed;
+}
+
+function seedWorkspaceBlocksFromAccessDeniedTasks(): boolean {
+  let changed = false;
+  for (const task of tasks) {
+    if (!task.workspaceIds.length) continue;
+    const email = emails.find((item) => item.id === task.emailId);
+    if (!email) continue;
+    const text = [
+      task.error || "",
+      task.accessTokenLivenessMessage || "",
+      ...(task.logs || []).map((log) => log.message || ""),
+    ].join("\n");
+    if (!isOpenAiWorkspaceAccessDeniedMessage(text)) continue;
+    const result = recordEmailWorkspaceBlock({
+      email: task.email || email.email,
+      workspaceIds: task.workspaceIds,
+      reason: task.error || task.accessTokenLivenessMessage || "OpenAI 403 workspace access denied",
+      source: `historical-task:${task.id}`,
+      accountName: task.sub2apiAccount || email.sub2apiAccount,
+    });
+    changed = changed || result.changed;
+  }
+  return changed;
+}
+
+function relatedK12TasksForRoot(root: string, workspaceIds?: string[]): K12Task[] {
+  return tasks.filter((task) => (
+    (task.kind || "k12") === "k12"
+    && rootMailboxIdentityByEmailId(task.emailId) === root
+    && (workspaceIds === undefined || taskWorkspaceKeysOverlap(task.workspaceIds, workspaceIds))
+  ));
 }
 
 function isFissionChildEmail(email: EmailRecord, root: string): boolean {
   return rootMailboxIdentity(email) === root && (Boolean(email.parentEmail) || (Boolean(email.smsBowerMailRoot) && email.email.toLowerCase() !== root));
 }
 
-function successfulFissionChildrenForRoot(root: string): number {
+function successfulFissionChildrenForRoot(root: string, workspaceIds?: string[]): number {
   const successful = new Set<string>();
-  for (const task of relatedK12TasksForRoot(root)) {
+  for (const task of relatedK12TasksForRoot(root, workspaceIds)) {
     if (task.status !== "success") continue;
     const email = emails.find((item) => item.id === task.emailId);
     if (!email || !isFissionChildEmail(email, root)) continue;
+    if (taskHasOpenAiUserAlreadyExists(task, email)) continue;
     successful.add(email.email.toLowerCase());
   }
   return successful.size;
 }
 
-function accountExistsFissionFailuresForRoot(root: string): number {
-  const failed = new Set<string>();
-  for (const task of relatedK12TasksForRoot(root)) {
-    const email = emails.find((item) => item.id === task.emailId);
-    if (!email || !isFissionChildEmail(email, root)) continue;
-    const text = [
-      task.error || "",
-      email.lastError || "",
-      ...(task.logs || []).map((log) => log.message || ""),
-    ].join("\n");
-    if (!isOpenAiUserAlreadyExistsMessage(text)) continue;
-    failed.add(email.email.toLowerCase());
+function taskHasOpenAiUserAlreadyExists(task: K12Task, email?: EmailRecord): boolean {
+  const text = [
+    task.error || "",
+    email?.lastError || "",
+    ...(task.logs || []).map((log) => log.message || ""),
+  ].join("\n");
+  return isOpenAiUserAlreadyExistsMessage(text);
+}
+
+function markPoolFissionMailboxOtpCooldown(parent: EmailRecord, root: string, task: K12Task, delayMs = POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS): string {
+  const workspaceText = task.workspaceIds?.[0] ? ` workspace=${task.workspaceIds[0]}` : "";
+  const notBefore = new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+  parent.updatedAt = nowIso();
+  appendLog(task, "warn", `邮箱池母号 ${root}${workspaceText} 未收到新的登录验证码，收码冷却 ${Math.ceil(delayMs / 60000)} 分钟，先轮转其他 workspace，冷却后继续补分裂`);
+  return notBefore;
+}
+
+function markPoolFissionUserAlreadyExistsCooldown(parent: EmailRecord, root: string, task: K12Task, delayMs = POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS): string {
+  const workspaceText = task.workspaceIds?.[0] ? ` workspace=${task.workspaceIds[0]}` : "";
+  const notBefore = new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+  parent.updatedAt = nowIso();
+  appendLog(task, "warn", `邮箱池母号 ${root}${workspaceText} 出现 user_already_exists，按临时 400 冷却 ${Math.ceil(delayMs / 60000)} 分钟，先轮转其他 workspace，冷却后继续补分裂`);
+  return notBefore;
+}
+
+function workspaceIdsFromKey(key: string): string[] {
+  return key === "__no_workspace__" ? [] : [key];
+}
+
+function poolFissionWorkspaceVariantsForRoot(root: string, currentWorkspaceIds: string[]): string[][] {
+  const keys: string[] = [];
+  const add = (workspaceIds: string[] | undefined) => {
+    const key = taskWorkspaceKey(workspaceIds);
+    if (!keys.includes(key)) keys.push(key);
+  };
+
+  for (const workspaceId of appConfig.workspaceIds) add(workspaceId ? [workspaceId] : []);
+  for (const task of relatedK12TasksForRoot(root)) add(task.workspaceIds);
+  add(currentWorkspaceIds);
+
+  const currentKey = taskWorkspaceKey(currentWorkspaceIds);
+  const currentIndex = keys.indexOf(currentKey);
+  const ordered = currentIndex >= 0
+    ? [...keys.slice(currentIndex + 1), ...keys.slice(0, currentIndex + 1)]
+    : keys;
+  return ordered.map(workspaceIdsFromKey);
+}
+
+function taskMailboxOtpTimeoutText(task: K12Task): string {
+  return [
+    task.error || "",
+    ...(task.logs || []).map((log) => log.message || ""),
+  ].join("\n");
+}
+
+function poolMailboxOtpCooldownDelayMs(root: string, workspaceIds: string[], nowMs = Date.now()): number {
+  let delayMs = 0;
+  for (const task of relatedK12TasksForRoot(root, workspaceIds)) {
+    const cooldownText = taskMailboxOtpTimeoutText(task);
+    if (!isMailboxOtpDeliveryTimeoutMessage(cooldownText) && !isOpenAiUserAlreadyExistsMessage(cooldownText)) continue;
+    const finishedAtMs = Date.parse(task.finishedAt || task.updatedAt || task.createdAt);
+    const taskDelay = poolFissionMailboxOtpCooldownDelayMs({
+      isChildEmail: true,
+      isSmsBowerMail: false,
+      mailboxOtpDeliveryTimeout: true,
+      nowMs,
+      cooldownMs: appConfig.poolFissionMailboxOtpCooldownMs,
+      finishedAtMs,
+    });
+    delayMs = Math.max(delayMs, taskDelay);
   }
-  return failed.size;
+  return delayMs;
 }
 
-function shouldStopPoolFissionForAccountExists(root: string): boolean {
-  return accountExistsFissionFailuresForRoot(root) >= POOL_FISSION_ACCOUNT_EXISTS_STOP_THRESHOLD
-    && successfulFissionChildrenForRoot(root) > 0;
+function poolFissionDeficitForWorkspace(root: string, workspaceIds: string[]): {
+  targetSuccesses: number;
+  successfulChildren: number;
+  activeTasks: number;
+  deficit: number;
+} {
+  const successfulChildren = successfulFissionChildrenForRoot(root, workspaceIds);
+  const activeTasks = activeFissionTasksForRoot(root, workspaceIds);
+  const targetSuccesses = fissionTargetForRoot(root, successfulChildren, undefined, workspaceIds);
+  return {
+    targetSuccesses,
+    successfulChildren,
+    activeTasks,
+    deficit: fissionTopUpDeficit({targetSuccesses, successfulChildren, activeTasks}),
+  };
 }
 
-function activeFissionTasksForRoot(root: string): number {
-  return relatedK12TasksForRoot(root).filter((task) => task.status === "queued" || task.status === "running").length;
+function enqueuePoolFissionChildTask(parent: EmailRecord, template: K12Task, workspaceIds: string[], nextRemaining: number, notBefore?: string): K12Task {
+  const child = createPoolFissionChild(parent);
+  const childTask = enqueueK12Task(child, {
+    route: template.route,
+    workspaceIds,
+    runWorkspaceJoin: template.runWorkspaceJoin,
+    runSub2Api: template.runSub2Api,
+    sub2apiNoRtMode: template.sub2apiNoRtMode === true,
+    sub2apiGroupName: template.sub2apiGroupName,
+    fissionRemainingAfterThis: nextRemaining,
+    notBefore,
+  });
+  return childTask;
 }
 
-function fissionTargetForRoot(root: string, successfulChildren: number, requestedTarget?: unknown): number {
+async function enqueueNextAvailablePoolFissionWorkspace(parent: EmailRecord, root: string, template: K12Task, skipWorkspaceIds: string[]): Promise<K12Task | undefined> {
+  for (const workspaceIds of poolFissionWorkspaceVariantsForRoot(root, skipWorkspaceIds)) {
+    if (taskWorkspaceKeysOverlap(workspaceIds, skipWorkspaceIds)) continue;
+    const blockReason = exactWorkspaceBlockReason(parent.email, workspaceIds);
+    if (blockReason) continue;
+    if (poolMailboxOtpCooldownDelayMs(root, workspaceIds) > 0) continue;
+
+    const {targetSuccesses, successfulChildren, deficit} = poolFissionDeficitForWorkspace(root, workspaceIds);
+    if (deficit <= 0) continue;
+
+    const childTask = enqueuePoolFissionChildTask(
+      parent,
+      template,
+      workspaceIds,
+      fissionTopUpRemainingAfterThis(deficit),
+    );
+    const workspaceText = workspaceIds[0] ? ` workspace=${workspaceIds[0]}` : "";
+    appendLog(template, "info", `收码冷却轮转到下一个 workspace${workspaceText}: 当前 ${successfulChildren}/${targetSuccesses}，已创建补位子任务 ${childTask.email}`);
+    appendLog(childTask, "info", `由母邮箱 ${root} 收码冷却轮转创建${workspaceText}，目标 ${targetSuccesses}，当前成功子号 ${successfulChildren}`);
+    await Promise.all([persistTasks(), persistEmails()]);
+    scheduleTasks();
+    return childTask;
+  }
+  return undefined;
+}
+
+function normalizePoolUserAlreadyExistsCooldownRecords(): {tasksChanged: boolean; emailsChanged: boolean; normalized: number} {
+  let tasksChanged = false;
+  let emailsChanged = false;
+  let normalized = 0;
+  for (const task of tasks) {
+    const email = emails.find((item) => item.id === task.emailId);
+    if (!email) continue;
+    if (!shouldCooldownPoolFissionAfterUserAlreadyExists({
+      isSmsBowerMail: email.otpMode === "smsbower-mail",
+      isChildEmail: Boolean(email.parentEmail),
+      userAlreadyExists: taskHasOpenAiUserAlreadyExists(task, email),
+    })) {
+      continue;
+    }
+
+    const retryableError = task.error || email.lastError || "OpenAI user_already_exists，进入 400 冷却后可继续补分裂";
+    const changedTask = task.status !== "failed" || task.error !== retryableError;
+    if (changedTask) {
+      task.status = "failed";
+      task.error = retryableError;
+      task.finishedAt = task.finishedAt || nowIso();
+      task.updatedAt = nowIso();
+      if (!(task.logs || []).some((log) => /已改为 400 冷却/.test(log.message || ""))) {
+        appendLog(task, "warn", "历史 user_already_exists 子号已改为 400 冷却，可继续补分裂");
+      }
+      tasksChanged = true;
+    }
+
+    const changedEmail = email.status !== "failed"
+      || email.lastError !== retryableError
+      || email.lastTaskId !== task.id;
+    if (changedEmail) {
+      email.status = "failed";
+      email.lastError = retryableError;
+      email.lastTaskId = task.id;
+      email.updatedAt = nowIso();
+      emailsChanged = true;
+    }
+
+    if (changedTask || changedEmail) {
+      normalized += 1;
+    }
+  }
+  return {tasksChanged, emailsChanged, normalized};
+}
+
+async function normalizeAndPersistPoolUserAlreadyExistsCooldownRecords(): Promise<number> {
+  const result = normalizePoolUserAlreadyExistsCooldownRecords();
+  if (result.tasksChanged || result.emailsChanged) {
+    await Promise.all([
+      result.tasksChanged ? persistTasks() : Promise.resolve(),
+      result.emailsChanged ? persistEmails() : Promise.resolve(),
+    ]);
+  }
+  return result.normalized;
+}
+
+function activeFissionTasksForRoot(root: string, workspaceIds?: string[]): number {
+  return relatedK12TasksForRoot(root, workspaceIds).filter((task) => task.status === "queued" || task.status === "running").length;
+}
+
+function fissionTargetForRoot(root: string, successfulChildren: number, requestedTarget?: unknown, workspaceIds?: string[]): number {
   const requested = requestedTarget === undefined ? 0 : asNumber(requestedTarget, 0, 0, 100);
-  const taskCounterTarget = relatedK12TasksForRoot(root)
+  const taskCounterTarget = relatedK12TasksForRoot(root, workspaceIds)
     .map((task) => task.smsBowerFissionRemainingAfterThis)
     .filter((value): value is number => Number.isFinite(value))
     .reduce((max, value) => Math.max(max, value), 0);
   const rootEmail = emails.find((email) => email.email.toLowerCase() === root && !email.parentEmail);
-  const remainingTarget = rootEmail?.smsBowerFissionChildrenRemaining === undefined
+  const remainingTarget = workspaceIds !== undefined || rootEmail?.smsBowerFissionChildrenRemaining === undefined
     ? 0
     : rootEmail.smsBowerFissionChildrenRemaining + successfulChildren;
   return Math.max(requested, taskCounterTarget, remainingTarget, successfulChildren);
 }
 
-function latestFissionTemplateTask(root: string): K12Task | undefined {
-  const related = relatedK12TasksForRoot(root);
+function latestFissionTemplateTask(root: string, workspaceIds?: string[]): K12Task | undefined {
+  const related = relatedK12TasksForRoot(root, workspaceIds);
   return [...related].sort((a, b) => {
     const aTime = Date.parse(a.finishedAt || a.updatedAt || a.createdAt);
     const bTime = Date.parse(b.finishedAt || b.updatedAt || b.createdAt);
@@ -2212,39 +2629,26 @@ async function createFissionTopUpTask(body: Record<string, unknown>): Promise<{
 }> {
   const root = asString(body.rootEmail).toLowerCase();
   if (!root) throw new Error("缺少母号邮箱");
+  const requestedWorkspaceIds = uniqueStringList(parseStringList(body.workspaceIds));
+  const scopedWorkspaceIds = requestedWorkspaceIds.length ? requestedWorkspaceIds.slice(0, 1) : undefined;
   const parent = emails.find((email) => email.email.toLowerCase() === root && !email.parentEmail);
   if (!parent) throw new Error(`找不到母号邮箱: ${root}`);
   if (parent.status === "banned") throw new Error(`母号已标记 GPT 封号，不能继续补分裂: ${root}`);
-  const relatedTasks = relatedK12TasksForRoot(root);
+  const relatedTasks = relatedK12TasksForRoot(root, scopedWorkspaceIds);
   const hasSmsBowerHistory = hasSmsBowerFissionHistory({tasks: relatedTasks, emails});
   const useSmsBowerTopUp = parent.otpMode === "smsbower-mail" || (hasSmsBowerHistory && Boolean(parent.smsBowerMailId));
   const blockReason = fissionTopUpBlockReason({otpMode: parent.otpMode, hasSmsBowerHistory});
   if (blockReason) throw new Error(blockReason);
 
-  const successfulChildren = successfulFissionChildrenForRoot(root);
-  const activeTasks = activeFissionTasksForRoot(root);
-  if (!useSmsBowerTopUp && shouldStopPoolFissionForAccountExists(root)) {
-    if (relatedTasks[0]) {
-      appendLog(relatedTasks[0], "warn", `邮箱池母号 ${root} 多个子号已存在，按当前成功子号 ${successfulChildren} 个结束分裂`);
-    }
-    parent.smsBowerFissionChildrenRemaining = 0;
-    parent.updatedAt = nowIso();
-    return {
-      created: [],
-      rootEmail: root,
-      targetSuccesses: successfulChildren,
-      successfulChildren,
-      deficit: 0,
-      activeTasks,
-    };
-  }
-  const targetSuccesses = fissionTargetForRoot(root, successfulChildren, body.targetSuccesses);
+  const successfulChildren = successfulFissionChildrenForRoot(root, scopedWorkspaceIds);
+  const activeTasks = activeFissionTasksForRoot(root, scopedWorkspaceIds);
+  const targetSuccesses = fissionTargetForRoot(root, successfulChildren, body.targetSuccesses, scopedWorkspaceIds);
   const deficit = fissionTopUpDeficit({targetSuccesses, successfulChildren, activeTasks});
   if (deficit <= 0) {
     return {created: [], rootEmail: root, targetSuccesses, successfulChildren, deficit, activeTasks};
   }
 
-  const template = latestFissionTemplateTask(root);
+  const template = latestFissionTemplateTask(root, scopedWorkspaceIds);
   if (!template) throw new Error(`找不到可复用的母号任务配置: ${root}`);
 
   if (useSmsBowerTopUp) {
@@ -2287,6 +2691,11 @@ async function createFissionTopUpTask(body: Record<string, unknown>): Promise<{
   }
 
   const child = createPoolFissionChild(parent);
+  const poolTopUpWorkspaceIds = template.workspaceIds || scopedWorkspaceIds || [];
+  const poolTopUpCooldownMs = poolMailboxOtpCooldownDelayMs(root, poolTopUpWorkspaceIds);
+  const poolTopUpNotBefore = poolTopUpCooldownMs > 0
+    ? new Date(Date.now() + poolTopUpCooldownMs).toISOString()
+    : undefined;
 
   const childTask = enqueueK12Task(child, {
     route: template.route,
@@ -2296,9 +2705,11 @@ async function createFissionTopUpTask(body: Record<string, unknown>): Promise<{
     sub2apiNoRtMode: template.sub2apiNoRtMode === true,
     sub2apiGroupName: template.sub2apiGroupName,
     fissionRemainingAfterThis: fissionTopUpRemainingAfterThis(deficit),
+    notBefore: poolTopUpNotBefore,
   });
-  appendLog(template, "info", `继续补分裂: ${root} 当前 ${successfulChildren}/${targetSuccesses}，已创建补位子任务 ${child.email}，缺口 ${deficit}`);
-  appendLog(childTask, "info", `继续补分裂创建，母邮箱 ${root}，目标 ${targetSuccesses}，当前成功子号 ${successfulChildren}`);
+  const cooldownText = poolTopUpNotBefore ? `，冷却后启动 notBefore=${poolTopUpNotBefore}` : "";
+  appendLog(template, poolTopUpNotBefore ? "warn" : "info", `继续补分裂: ${root} 当前 ${successfulChildren}/${targetSuccesses}，已创建补位子任务 ${child.email}，缺口 ${deficit}${cooldownText}`);
+  appendLog(childTask, "info", `继续补分裂创建，母邮箱 ${root}，目标 ${targetSuccesses}，当前成功子号 ${successfulChildren}${cooldownText}`);
   return {created: [childTask], rootEmail: root, targetSuccesses, successfulChildren, deficit, activeTasks};
 }
 
@@ -2418,25 +2829,42 @@ function splitEmails(ids: string[], perParent: number): {created: number; skippe
   return {created: createdItems.length, skipped, items: createdItems.slice(0, 40)};
 }
 
-async function loadBundleModules() {
-  await ensureCompatBundleConfig();
-  const srcDir = path.join(appConfig.referenceBundlePath, "codex_register", "src");
-  const openaiPath = pathToFileURL(path.join(srcDir, "openai.ts")).href;
-  const devicePath = pathToFileURL(path.join(srcDir, "device-profile.ts")).href;
-  const sub2ApiPath = pathToFileURL(path.join(srcDir, "sub2api.ts")).href;
-  const mailboxPath = pathToFileURL(path.join(srcDir, "mailbox-url.ts")).href;
-  const [openai, device, sub2api, mailbox] = await Promise.all([
-    import(openaiPath),
-    import(devicePath),
-    import(sub2ApiPath),
-    import(mailboxPath),
-  ]);
-  return {
-    OpenAIClient: openai.OpenAIClient,
-    generateRandomDeviceProfile: device.generateRandomDeviceProfile,
-    Sub2ApiClient: sub2api.Sub2ApiClient,
-    MailboxUrlCodeProvider: mailbox.MailboxUrlCodeProvider,
-  };
+interface BundleModules {
+  OpenAIClient: any;
+  generateRandomDeviceProfile: any;
+  Sub2ApiClient: any;
+  MailboxUrlCodeProvider: any;
+}
+
+let bundleModulesPromise: Promise<BundleModules> | undefined;
+
+async function loadBundleModules(): Promise<BundleModules> {
+  if (!bundleModulesPromise) {
+    bundleModulesPromise = (async () => {
+      await ensureCompatBundleConfig();
+      const srcDir = path.join(appConfig.referenceBundlePath, "codex_register", "src");
+      const openaiPath = pathToFileURL(path.join(srcDir, "openai.ts")).href;
+      const devicePath = pathToFileURL(path.join(srcDir, "device-profile.ts")).href;
+      const sub2ApiPath = pathToFileURL(path.join(srcDir, "sub2api.ts")).href;
+      const mailboxPath = pathToFileURL(path.join(srcDir, "mailbox-url.ts")).href;
+      const [openai, device, sub2api, mailbox] = await Promise.all([
+        import(openaiPath),
+        import(devicePath),
+        import(sub2ApiPath),
+        import(mailboxPath),
+      ]);
+      return {
+        OpenAIClient: openai.OpenAIClient,
+        generateRandomDeviceProfile: device.generateRandomDeviceProfile,
+        Sub2ApiClient: sub2api.Sub2ApiClient,
+        MailboxUrlCodeProvider: mailbox.MailboxUrlCodeProvider,
+      };
+    })().catch((error) => {
+      bundleModulesPromise = undefined;
+      throw error;
+    });
+  }
+  return bundleModulesPromise;
 }
 
 function assertNotCanceled(task: K12Task): void {
@@ -2804,6 +3232,9 @@ async function selectAuthWorkspace(client: any, task?: K12Task, referer = AUTH_W
     if (!response.ok) {
       lastError = `workspace_id=${workspaceId} HTTP ${response.status}: ${text.slice(0, 240)}`;
       if (task) appendLog(task, "warn", lastError);
+      if (isUnavailableWorkspaceSelectError(response.status, text)) {
+        await removeUnavailableWorkspaceIdFromState(workspaceId, lastError, task);
+      }
       continue;
     }
     try {
@@ -2850,8 +3281,18 @@ async function emailOtpValidateWithRetry(client: any, task?: K12Task): Promise<s
     if (email.otpMode === "smsbower-mail") {
       appendLog(task, "warn", "OpenAI 判定邮箱验证码错误，SMSBower 请求下一封验证码后重试一次");
       await requestSmsBowerNextMailCode(email, task, "邮箱验证码错误后请求下一封");
+      if (shouldResendLoginOtpAfterWrongCode({otpMode: email.otpMode})) {
+        appendLog(task, "info", "OpenAI 判定邮箱验证码错误，准备重新请求发送登录验证码");
+        const nextUrl = await sendEmailOtpForLogin(client, `${AUTH_BASE_URL}/email-verification`);
+        appendLog(task, "ok", loginOtpSendSuccessMessage(nextUrl));
+      }
       const code = await waitForSmsBowerMailCode(email, task, "登录重试");
       return client.emailOtpValidate(code);
+    }
+    if (shouldResendLoginOtpAfterWrongCode({otpMode: email.otpMode})) {
+      appendLog(task, "info", "OpenAI 判定邮箱验证码错误，准备重新请求发送登录验证码");
+      const nextUrl = await sendEmailOtpForLogin(client, `${AUTH_BASE_URL}/email-verification`);
+      appendLog(task, "ok", loginOtpSendSuccessMessage(nextUrl));
     }
     task.freshEmailOtpOnlyOnce = true;
     appendLog(task, "warn", "OpenAI 判定邮箱验证码错误，重新等待下一封新验证码后重试一次");
@@ -2869,6 +3310,7 @@ async function continueAuthSteps(
     if (task) appendLog(task, level, message);
   };
   let continueUrl = startUrl;
+  let emailOtpSentInFlow = false;
 
   for (let step = 0; step < 12; step += 1) {
     log("info", `OpenAI auth step: ${continueUrl}`);
@@ -2877,6 +3319,8 @@ async function continueAuthSteps(
       log("warn", "当前账号进入密码页；按配置不提交密码，尝试改走邮箱验证码登录");
       try {
         continueUrl = await sendEmailOtpForLogin(client, `${AUTH_BASE_URL}/log-in/password`);
+        log("ok", loginOtpSendSuccessMessage(continueUrl));
+        emailOtpSentInFlow = true;
       } catch (error) {
         throw new Error(
           `账号当前被 OpenAI 判定为密码登录步骤，已按配置尝试邮箱验证码登录，但 OpenAI 未允许发送邮箱验证码；该账号无法仅凭邮箱接码登录。原始错误：${error instanceof Error ? error.message : String(error)}`,
@@ -2900,10 +3344,22 @@ async function continueAuthSteps(
     if (continueUrl === AUTH_EMAIL_OTP_SEND_URL) {
       log("info", "OpenAI 要求发送邮箱验证码");
       continueUrl = await sendEmailOtpForSignup(client, AUTH_CREATE_ACCOUNT_PASSWORD_URL);
+      emailOtpSentInFlow = true;
       continue;
     }
 
     if (continueUrl === `${AUTH_BASE_URL}/email-verification`) {
+      if (shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: emailOtpSentInFlow})) {
+        log("info", "直接进入邮箱验证码页，本轮未触发发码，先重新请求发送登录验证码");
+        try {
+          continueUrl = await sendEmailOtpForLogin(client, `${AUTH_BASE_URL}/email-verification`);
+          log("ok", loginOtpSendSuccessMessage(continueUrl));
+        } catch (error) {
+          throw new Error(loginOtpSendFailureMessage(error));
+        }
+        emailOtpSentInFlow = true;
+        continue;
+      }
       log("info", "等待邮箱验证码并提交");
       continueUrl = await emailOtpValidateWithRetry(client, task);
       continue;
@@ -3076,6 +3532,26 @@ function markEmailBanned(email: EmailRecord, reason: string, task?: K12Task): vo
   }
 }
 
+function markEmailRegistrationExhausted(email: EmailRecord, reason: string, task?: K12Task): void {
+  email.status = "banned";
+  email.lastError = reason;
+  email.smsBowerFissionChildrenRemaining = 0;
+  email.updatedAt = nowIso();
+  for (const queuedTask of tasks) {
+    if (queuedTask.emailId !== email.id || queuedTask.id === task?.id || queuedTask.status !== "queued") continue;
+    queuedTask.status = "failed";
+    queuedTask.error = reason;
+    queuedTask.finishedAt = nowIso();
+    queuedTask.updatedAt = nowIso();
+    appendLog(queuedTask, "warn", `当前邮箱已存在或达到注册上限，队列任务跳过: ${reason}`);
+  }
+  if (task) {
+    task.error = reason;
+    task.updatedAt = nowIso();
+    appendLog(task, "warn", `当前邮箱已存在或达到注册上限，停止继续使用: ${reason}`);
+  }
+}
+
 function normalizeChatGptUserId(auth: Record<string, unknown>): string {
   const direct = asString(auth.chatgpt_user_id || auth.user_id);
   if (direct) return direct;
@@ -3211,7 +3687,11 @@ async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: s
   });
   const text = await response.text().catch(() => "");
   if (!response.ok) {
-    throw new Error(`auth workspace/select(K12) workspace_id=${workspaceId} HTTP ${response.status}: ${text.slice(0, 240)}`);
+    const message = `auth workspace/select(K12) workspace_id=${workspaceId} HTTP ${response.status}: ${text.slice(0, 240)}`;
+    if (isUnavailableWorkspaceSelectError(response.status, text)) {
+      await removeUnavailableWorkspaceIdFromState(workspaceId, message, task);
+    }
+    throw new Error(message);
   }
   try {
     const data = JSON.parse(text) as {continue_url?: string; page?: {payload?: {url?: string}}};
@@ -3849,6 +4329,24 @@ function sub2ApiAccountK12StatusError(account: Record<string, unknown>, accessTo
     active: unwrapped.active !== undefined ? asBoolean(unwrapped.active, true) : undefined,
     isActive: (unwrapped.is_active ?? unwrapped.isActive) !== undefined ? asBoolean(unwrapped.is_active ?? unwrapped.isActive, true) : undefined,
     deletedAt: asString(unwrapped.deleted_at || unwrapped.deletedAt),
+    message: unwrapped.message || unwrapped.msg,
+    error: unwrapped.error || unwrapped.err,
+    errorMessage: unwrapped.error_message
+      || unwrapped.errorMessage
+      || unwrapped.last_error
+      || unwrapped.lastError
+      || unwrapped.last_test_error
+      || unwrapped.lastTestError
+      || unwrapped.status_message
+      || unwrapped.statusMessage,
+    detail: unwrapped.detail,
+    reason: unwrapped.reason,
+    metadata: {
+      status_reason: unwrapped.status_reason,
+      statusReason: unwrapped.statusReason,
+      cooldown_reason: unwrapped.cooldown_reason,
+      cooldownReason: unwrapped.cooldownReason,
+    },
   });
 }
 
@@ -3864,13 +4362,76 @@ function mergeCredentials(existing: Record<string, unknown>, accessToken: string
   return next;
 }
 
-function expectedSub2ApiAccountNames(email: EmailRecord, groupName = appConfig.sub2apiGroupName || "k12"): string[] {
+function sub2ApiWorkspaceAccountSuffix(workspaceIds?: string[]): string {
+  const workspaceKey = taskWorkspaceKey(workspaceIds);
+  if (workspaceKey === "__no_workspace__") return "";
+  return `--ws-${workspaceKey.replace(/[^a-z0-9_-]/gi, "").slice(0, 48)}`;
+}
+
+function sub2ApiOAuthAccountName(email: EmailRecord, groupName = appConfig.sub2apiGroupName || "k12", workspaceIds?: string[]): string {
   const primaryGroupName = primarySub2ApiGroupName(groupName);
+  return `${email.email}---${primaryGroupName}${sub2ApiWorkspaceAccountSuffix(workspaceIds)}`;
+}
+
+function sub2ApiNoRtAccountName(email: EmailRecord, workspaceIds?: string[]): string {
+  return `${email.email}--noRT${sub2ApiWorkspaceAccountSuffix(workspaceIds)}`;
+}
+
+function expectedSub2ApiAccountNames(email: EmailRecord, groupName = appConfig.sub2apiGroupName || "k12", workspaceIds?: string[]): string[] {
+  const primaryGroupName = primarySub2ApiGroupName(groupName);
+  const savedAccount = asString(email.sub2apiAccount);
+  const workspaceSuffix = sub2ApiWorkspaceAccountSuffix(workspaceIds).toLowerCase();
+  const savedAccountMatchesWorkspace = savedAccount && (
+    !workspaceSuffix
+    || savedAccount.toLowerCase().includes(workspaceSuffix)
+  );
   return Array.from(new Set([
-    asString(email.sub2apiAccount),
+    sub2ApiOAuthAccountName(email, primaryGroupName, workspaceIds),
+    sub2ApiNoRtAccountName(email, workspaceIds),
+    savedAccountMatchesWorkspace ? savedAccount : "",
     `${email.email}---${primaryGroupName}`,
     `${email.email}--noRT`,
   ].filter(Boolean)));
+}
+
+function expectedSub2ApiAccountNamesForWorkspaceCandidates(
+  email: EmailRecord,
+  groupName = appConfig.sub2apiGroupName || "k12",
+  workspaceCandidates: string[] = appConfig.workspaceIds,
+): string[] {
+  const names = new Set<string>();
+  for (const name of expectedSub2ApiAccountNames(email, groupName)) {
+    if (name) names.add(name);
+  }
+  for (const workspaceId of workspaceCandidates) {
+    for (const name of expectedSub2ApiAccountNames(email, groupName, workspaceId ? [workspaceId] : [])) {
+      if (name) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+function workspaceIdsForSub2ApiAccountIssue(account: Record<string, unknown>, localEmail?: EmailRecord, fallbackWorkspaceIds: string[] = appConfig.workspaceIds): string[] {
+  const accountName = sub2ApiAccountName(account).toLowerCase();
+  const byAccountName = appConfig.workspaceIds.filter((workspaceId) => {
+    const suffix = sub2ApiWorkspaceAccountSuffix([workspaceId]).toLowerCase();
+    return suffix && accountName.includes(suffix);
+  });
+  if (byAccountName.length) return uniqueStringList(byAccountName);
+
+  const byTaskHistory = tasks
+    .filter((task) => (
+      task.workspaceIds.length
+      && (
+        (localEmail && task.emailId === localEmail.id)
+        || (accountName && asString(task.sub2apiAccount).toLowerCase() === accountName)
+      )
+    ))
+    .flatMap((task) => task.workspaceIds);
+  if (byTaskHistory.length) return uniqueStringList(byTaskHistory);
+
+  const fallback = uniqueStringList(fallbackWorkspaceIds);
+  return fallback.length === 1 ? fallback : [];
 }
 
 function findAccountsByNames(accounts: unknown[], names: string[]): Record<string, unknown>[] {
@@ -4254,6 +4815,51 @@ async function listSub2ApiAccountsForGroup(
   }
 }
 
+interface LocalSub2ApiPruneResult {
+  removedTasks: number;
+  clearedEmails: number;
+}
+
+function isSub2ApiAccountNameInGroupScope(accountName: string, groupName: string): boolean {
+  const name = asString(accountName).toLowerCase();
+  if (!name) return false;
+  const group = primarySub2ApiGroupName(groupName).toLowerCase();
+  return name.endsWith(`---${group}`)
+    || name.includes(`---${group}--ws-`)
+    || name.endsWith("--nort")
+    || name.includes("--nort--ws-");
+}
+
+async function pruneLocalSub2ApiRecordsForListedAccounts(
+  listed: {matchedAccounts: Record<string, unknown>[]},
+  groupName: string,
+): Promise<LocalSub2ApiPruneResult> {
+  const existingNames = listed.matchedAccounts.map(sub2ApiAccountName).filter(Boolean);
+  const pruned = pruneTasksForMissingSub2ApiAccounts(emails, tasks, existingNames, {
+    shouldInspectAccountName: (accountName) => isSub2ApiAccountNameInGroupScope(accountName, groupName),
+  });
+  emails = pruned.emails;
+  tasks = pruned.tasks;
+  if (pruned.removedTasks || pruned.clearedEmails) {
+    await Promise.all([persistTasks(), persistEmails()]);
+  }
+  return {removedTasks: pruned.removedTasks, clearedEmails: pruned.clearedEmails};
+}
+
+async function pruneLocalSub2ApiRecordsForMissingAccountNames(accountNames: string[]): Promise<LocalSub2ApiPruneResult> {
+  const missingNames = new Set(accountNames.map((item) => item.toLowerCase()).filter(Boolean));
+  if (!missingNames.size) return {removedTasks: 0, clearedEmails: 0};
+  const pruned = pruneTasksForMissingSub2ApiAccounts(emails, tasks, [], {
+    shouldInspectAccountName: (accountName) => missingNames.has(accountName.toLowerCase()),
+  });
+  emails = pruned.emails;
+  tasks = pruned.tasks;
+  if (pruned.removedTasks || pruned.clearedEmails) {
+    await Promise.all([persistTasks(), persistEmails()]);
+  }
+  return {removedTasks: pruned.removedTasks, clearedEmails: pruned.clearedEmails};
+}
+
 function credentialExpiryMs(value: unknown): number {
   if (value === undefined || value === null || value === "") return 0;
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -4431,6 +5037,7 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
     if (!group) throw new Error(`Sub2API 未找到补号分组: ${groupName}`);
 
     const listed = await listSub2ApiAccountsForGroup(origin, adminToken, group);
+    const localPrune = await pruneLocalSub2ApiRecordsForListedAccounts(listed, group.name);
     const basicNormalAccounts = listed.matchedAccounts.filter(sub2ApiAccountIsNormal);
     let normalAccounts = basicNormalAccounts.length;
     let deepChecked = 0;
@@ -4500,6 +5107,9 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
     } else {
       message += "，未创建新任务";
     }
+    if (localPrune.removedTasks || localPrune.clearedEmails) {
+      message += `，已清理 Sub2 已删除本地任务 ${localPrune.removedTasks} 个/解绑 ${localPrune.clearedEmails} 个`;
+    }
 
     const result: Sub2ApiRefillResult = {
       checkedAt: sub2apiRefillLastCheckedAt,
@@ -4522,6 +5132,8 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
       createdTasks,
       skippedRunning,
       missing,
+      prunedTasks: localPrune.removedTasks,
+      clearedSub2Links: localPrune.clearedEmails,
       message,
       samples,
     };
@@ -4554,15 +5166,19 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
   }
 }
 
-function sub2ApiAccountK12RepairIssue(account: Record<string, unknown>): {issue: K12RepairIssue; message: string} | null {
+function sub2ApiAccountK12RepairIssue(account: Record<string, unknown>): {issue: K12RepairIssue; message: string; repairable: boolean} | null {
   const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
   const statusError = sub2ApiAccountK12StatusError(account, accessToken, appConfig.workspaceIds);
   if (statusError) {
-    return {issue: SUB2API_K12_STATUS_ERROR_ISSUE, message: statusError};
+    return {
+      issue: SUB2API_K12_STATUS_ERROR_ISSUE,
+      message: statusError,
+      repairable: !isTerminalK12AccessDeniedMessage(statusError),
+    };
   }
   const planMismatch = sub2ApiAccountK12PlanMismatch(account, accessToken, appConfig.workspaceIds);
   if (planMismatch) {
-    return {issue: K12_PLAN_MISMATCH_ISSUE, message: planMismatch};
+    return {issue: K12_PLAN_MISMATCH_ISSUE, message: planMismatch, repairable: true};
   }
   return null;
 }
@@ -4605,6 +5221,7 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
     if (!group) throw new Error(`Sub2API 未找到自动补 AT 分组: ${groupName}`);
 
     const listed = await listSub2ApiAccountsForGroup(origin, adminToken, group);
+    const localPrune = await pruneLocalSub2ApiRecordsForListedAccounts(listed, group.name);
     const samples: string[] = [];
     const queuedEmailIds = new Set<string>();
     let issueAccounts = 0;
@@ -4612,14 +5229,46 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
     let createdTasks = 0;
     let skippedRunning = 0;
     let skippedUnmatched = 0;
+    let skippedTerminal = 0;
 
     for (const account of listed.matchedAccounts) {
-      const issue = sub2ApiAccountK12RepairIssue(account);
+      const accountName = sub2ApiAccountName(account) || "(unnamed)";
+      let issue = sub2ApiAccountK12RepairIssue(account);
+      if (!issue) {
+        const accountId = sub2ApiAccountId(account);
+        const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
+        const planMismatch = sub2ApiAccountK12PlanMismatch(account, accessToken, appConfig.workspaceIds);
+        if (!planMismatch && accountId && sub2ApiAccountIsNormal(account)) {
+          const liveness = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+          issue = sub2ApiK12LivenessIssue({planMismatch, liveness});
+        }
+      }
       if (!issue) continue;
       if (!isAutoAtRepairIssue(issue.issue)) continue;
-      issueAccounts += 1;
-      const accountName = sub2ApiAccountName(account) || "(unnamed)";
       const localEmail = findLocalEmailForSub2ApiAccount(account);
+      if (!issue.repairable) {
+        skippedTerminal += 1;
+        const issueWorkspaceIds = workspaceIdsForSub2ApiAccountIssue(account, localEmail, appConfig.workspaceIds);
+        const candidateEmail = sub2ApiAccountEmailCandidatesFromName(accountName)[0] || "";
+        const blockedEmail = localEmail?.email || candidateEmail;
+        if (blockedEmail && issueWorkspaceIds.length) {
+          await blockEmailWorkspace({
+            email: blockedEmail,
+            workspaceIds: issueWorkspaceIds,
+            reason: issue.message,
+            source: `sub2api-auto-at-repair:${source}`,
+            accountName,
+          });
+          if (samples.length < 10) {
+            samples.push(`${blockedEmail}: ${issue.message}，已标记该邮箱/workspace 为 403 死号，跳过补 AT`);
+          }
+        } else {
+          skippedUnmatched += 1;
+          if (samples.length < 10) samples.push(`${accountName}: ${issue.message}，403 工作区拒绝访问，但未能确定本地邮箱或 workspace`);
+        }
+        continue;
+      }
+      issueAccounts += 1;
       if (!localEmail) {
         skippedUnmatched += 1;
         if (samples.length < 10) samples.push(`${accountName}: ${issue.message}，未匹配到本地邮箱`);
@@ -4631,6 +5280,7 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
         matchedLocalEmail: true,
         emailStatus: localEmail.status,
         hasActiveTask: hasActiveTask(localEmail.id) || queuedEmailIds.has(localEmail.id),
+        message: issue.message,
       });
       if (!canCreate) {
         skippedRunning += 1;
@@ -4653,9 +5303,13 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
       }
     }
 
+    const terminalSuffix = skippedTerminal ? `，跳过 403 死号 ${skippedTerminal} 个` : "";
+    const pruneSuffix = localPrune.removedTasks || localPrune.clearedEmails
+      ? `，已清理 Sub2 已删除本地任务 ${localPrune.removedTasks} 个/解绑 ${localPrune.clearedEmails} 个`
+      : "";
     const message = issueAccounts
-      ? `自动补 AT 扫描 ${listed.matchedAccounts.length} 个账号，发现 K12 错误 ${issueAccounts} 个，已创建修复任务 ${createdTasks} 个`
-      : `自动补 AT 扫描 ${listed.matchedAccounts.length} 个账号，未发现 K12 错误`;
+      ? `自动补 AT 扫描 ${listed.matchedAccounts.length} 个账号，发现可补 K12 错误 ${issueAccounts} 个，已创建修复任务 ${createdTasks} 个${terminalSuffix}`
+      : `自动补 AT 扫描 ${listed.matchedAccounts.length} 个账号，未发现可补 K12 错误${terminalSuffix}`;
     const result: Sub2ApiAutoAtRepairResult = {
       checkedAt: sub2apiAutoAtRepairLastCheckedAt,
       source,
@@ -4667,7 +5321,10 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
       createdTasks,
       skippedRunning,
       skippedUnmatched,
-      message,
+      skippedTerminal,
+      prunedTasks: localPrune.removedTasks,
+      clearedSub2Links: localPrune.clearedEmails,
+      message: `${message}${pruneSuffix}`,
       samples,
     };
     sub2apiAutoAtRepairLastResult = result;
@@ -4724,7 +5381,14 @@ async function testOpenAiAccessToken(accessToken: string, model = DEFAULT_AT_LIV
     }
     const reason = pickErrorMessage(parsed, text.slice(0, 240) || `HTTP ${response.status}`);
     const message = `AT 失效/不可用: HTTP ${response.status}: ${reason}`;
-    return {ok: false, status: response.status, message, latencyMs, banned: isOpenAiAccountBannedMessage(`${reason}\n${text}`)};
+    const terminalText = `${reason}\n${text}`;
+    return {
+      ok: false,
+      status: response.status,
+      message,
+      latencyMs,
+      banned: isOpenAiAccountBannedMessage(terminalText) || isOpenAiWorkspaceAccessDeniedMessage(terminalText),
+    };
   } catch (error) {
     const latencyMs = Date.now() - startedAt;
     if (error instanceof Error && error.name === "AbortError") {
@@ -4742,7 +5406,7 @@ async function testSub2ApiAccountLiveness(
   adminToken: string,
   accountId: string,
   model = DEFAULT_AT_LIVENESS_MODEL,
-): Promise<{ok: boolean; status: number; message: string; latencyMs: number}> {
+): Promise<{ok: boolean; status: number; message: string; latencyMs: number; banned?: boolean}> {
   const startedAt = Date.now();
   try {
     const data = await requestSub2ApiJson(origin, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}/test`, {
@@ -4760,13 +5424,31 @@ async function testSub2ApiAccountLiveness(
     const lower = raw.toLowerCase();
     const latencyMs = Date.now() - startedAt;
     if (lower.includes("\"type\":\"error\"") || lower.includes("\"success\":false")) {
-      return {ok: false, status: 0, message: `Sub2API 测活失败: ${raw.slice(0, 240)}`, latencyMs};
+      return {
+        ok: false,
+        status: sub2ApiTestErrorStatus(raw),
+        message: `Sub2API 测活失败: ${raw.slice(0, 240)}`,
+        latencyMs,
+        banned: isOpenAiWorkspaceAccessDeniedMessage(raw),
+      };
     }
     return {ok: true, status: 200, message: `Sub2API 测活通过 / ${latencyMs}ms`, latencyMs};
   } catch (error) {
     const latencyMs = Date.now() - startedAt;
-    return {ok: false, status: 0, message: `Sub2API 测活失败: ${error instanceof Error ? error.message : String(error)}`, latencyMs};
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      status: sub2ApiTestErrorStatus(message),
+      message: `Sub2API 测活失败: ${message}`,
+      latencyMs,
+      banned: isOpenAiWorkspaceAccessDeniedMessage(message),
+    };
   }
+}
+
+function sub2ApiTestErrorStatus(raw: string): number {
+  const match = String(raw || "").match(/(?:API returned|HTTP|Access forbidden\s*\()\s*(\d{3})/i);
+  return match ? Number(match[1]) || 0 : 0;
 }
 
 async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<{
@@ -4781,11 +5463,14 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
     message: string;
     latencyMs: number;
     repairTaskId?: string;
+    repairable?: boolean;
   }>;
   ok: number;
   failed: number;
   missing: number;
   skippedRunning: number;
+  prunedTasks: number;
+  clearedSub2Links: number;
 }> {
   const requestedEmailIds = Array.isArray(body.emailIds)
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
@@ -4808,9 +5493,12 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
     message: string;
     latencyMs: number;
     repairTaskId?: string;
+    repairable?: boolean;
   }> = [];
   let skippedRunning = 0;
   let changedEmails = false;
+  let prunedTasks = 0;
+  let clearedSub2Links = 0;
 
   const {origin, token: adminToken} = await loginSub2ApiAdmin();
 
@@ -4822,9 +5510,12 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
 
     const startedAt = Date.now();
     try {
-      const names = expectedSub2ApiAccountNames(email, sub2apiGroupName);
+      const names = expectedSub2ApiAccountNamesForWorkspaceCandidates(email, sub2apiGroupName, appConfig.workspaceIds);
       const account = await findSub2ApiAccountByName(origin, adminToken, names);
       if (!account) {
+        const localPrune = await pruneLocalSub2ApiRecordsForMissingAccountNames(names);
+        prunedTasks += localPrune.removedTasks;
+        clearedSub2Links += localPrune.clearedEmails;
         if (onlyK12RepairIssues) continue;
         const message = `Sub2API 未找到账号: ${names.join(" / ")}`;
         items.push({
@@ -4865,6 +5556,19 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
       const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
       const k12StatusError = sub2ApiAccountK12StatusError(account, accessToken, appConfig.workspaceIds);
       if (k12StatusError) {
+        const repairable = !isTerminalK12AccessDeniedMessage(k12StatusError);
+        if (!repairable) {
+          const issueWorkspaceIds = workspaceIdsForSub2ApiAccountIssue(account, email, appConfig.workspaceIds);
+          await blockEmailWorkspace({
+            email: email.email,
+            workspaceIds: issueWorkspaceIds,
+            reason: k12StatusError,
+            source: "email-check-at",
+            accountName,
+          });
+          if (onlyK12RepairIssues) continue;
+        }
+        if (onlyK12RepairIssues && !repairable) continue;
         items.push({
           emailId: email.id,
           email: email.email,
@@ -4872,9 +5576,10 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
           accountId,
           ok: false,
           issue: SUB2API_K12_STATUS_ERROR_ISSUE,
-          status: 409,
+          status: repairable ? 409 : 403,
           message: k12StatusError,
           latencyMs: Date.now() - startedAt,
+          repairable,
         });
         continue;
       }
@@ -4920,6 +5625,16 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
       } else {
         result = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
       }
+      if (isOpenAiWorkspaceAccessDeniedMessage(result.message)) {
+        const issueWorkspaceIds = workspaceIdsForSub2ApiAccountIssue(account, email, appConfig.workspaceIds);
+        await blockEmailWorkspace({
+          email: email.email,
+          workspaceIds: issueWorkspaceIds,
+          reason: result.message,
+          source: "email-check-at-liveness",
+          accountName,
+        });
+      }
       items.push({
         emailId: email.id,
         email: email.email,
@@ -4952,6 +5667,8 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
     failed: items.filter((item) => !item.ok).length,
     missing,
     skippedRunning,
+    prunedTasks,
+    clearedSub2Links,
   };
 }
 
@@ -5031,7 +5748,7 @@ async function checkTaskAccessTokenWithOptions(
     try {
       appendLog(task, "info", "直接 AT 返回授权失败，改查 Sub2API 账号测活");
       const {origin, token: adminToken} = await loginSub2ApiAdmin();
-      const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName);
+      const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName, task.workspaceIds);
       const matchedAccounts = await findSub2ApiAccountsByName(origin, adminToken, names);
       const account = matchedAccounts[0];
       const accountId = account ? sub2ApiAccountId(account) : "";
@@ -5067,7 +5784,17 @@ async function checkTaskAccessTokenWithOptions(
 
   let repairTask: K12Task | undefined;
   if (result.banned) {
-    markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止继续获取 AT", task);
+    if (isOpenAiWorkspaceAccessDeniedMessage(result.message)) {
+      await blockEmailWorkspace({
+        email: task.email || email.email,
+        workspaceIds: targetK12WorkspaceIds(task),
+        reason: result.message,
+        source: "task-check-at",
+        accountName: task.sub2apiAccount || email.sub2apiAccount,
+      });
+    } else {
+      markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止继续获取 AT", task);
+    }
   } else if (options.autoRepair !== false && !result.ok && (result.status === 401 || result.status === 409)) {
     appendLog(task, "warn", `${result.status === 409 ? "AT 套餐不是 K12" : "AT 返回 401"}，自动创建 AT 修复任务`);
     const created = createAtRepairTasks({
@@ -5287,7 +6014,7 @@ async function createSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: Ema
   const proxy = await resolveSub2ApiProxy(origin, adminToken);
 
   const credentials = buildSub2ApiCredentialsFromAccessToken(accessToken, email.email);
-  const accountName = `${email.email}--noRT`;
+  const accountName = sub2ApiNoRtAccountName(email, task.workspaceIds);
   await requestSub2ApiJson(origin, "/api/v1/admin/accounts", {
     method: "POST",
     token: adminToken,
@@ -5311,7 +6038,7 @@ async function createSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: Ema
 
 async function upsertSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: EmailRecord, accessToken: string): Promise<string> {
   const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || appConfig.sub2apiGroupName);
-  const accountName = `${email.email}--noRT`;
+  const accountName = sub2ApiNoRtAccountName(email, task.workspaceIds);
   const {origin, token: adminToken} = await loginSub2ApiAdmin();
   const groups = await resolveSub2ApiGroups(origin, adminToken, groupNames);
   const proxy = await resolveSub2ApiProxy(origin, adminToken);
@@ -5398,7 +6125,11 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
       baseline = await mailboxProvider.snapshot();
       appendLog(task, "info", "邮箱基线已读取，等待新验证码");
     } catch (error) {
-      appendLog(task, "warn", `邮箱基线读取失败，将直接轮询新验证码: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      if (isMailboxAccountInvalidMessage(message)) {
+        throw new Error(`邮箱池账号不可用，停止任务: ${message}`);
+      }
+      appendLog(task, "warn", `邮箱基线读取失败，将直接轮询新验证码: ${message}`);
     }
 
     fetchOtp = async (label: string) => {
@@ -5406,12 +6137,26 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
       const retryAfterWrongOtp = task.freshEmailOtpOnlyOnce === true;
       task.freshEmailOtpOnlyOnce = false;
       if (retryAfterWrongOtp) {
-        appendLog(task, "info", "本次只接受新验证码，不再使用邮箱基线旧验证码兜底");
+        const retryWait = mailboxOtpWaitOptions({retryAfterWrongOtp});
+        appendLog(task, "info", `本次只接受新验证码，不再使用邮箱基线旧验证码兜底，最多等待 ${Math.ceil(retryWait.timeoutMs / 1000)} 秒`);
       }
-      const code = await mailboxProvider.waitForCode({
-        baseline,
-        ...mailboxOtpWaitOptions({retryAfterWrongOtp}),
-      });
+      let code = "";
+      try {
+        code = await mailboxProvider.waitForCode({
+          baseline,
+          ...mailboxOtpWaitOptions({retryAfterWrongOtp}),
+          fetchTimeoutMs: 10000,
+          progressIntervalMs: 30000,
+          onProgress: (event: {attempt: number; elapsedMs: number; lastError: string}) => {
+            appendLog(task, "info", `${label} 验证码暂未收到，继续等待 (${Math.ceil(event.elapsedMs / 1000)}s): ${event.lastError}`);
+          },
+        });
+      } catch (error) {
+        if (retryAfterWrongOtp && isMailboxBaselineCodeTimeoutMessage(error)) {
+          throw new Error(`邮箱池未收到新的登录验证码，仍然只返回旧验证码: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        throw error;
+      }
       appendLog(task, "ok", `${label} 验证码已获取`);
       try {
         baseline = await mailboxProvider.snapshot();
@@ -5858,16 +6603,16 @@ async function runTask(task: K12Task): Promise<void> {
     await persistTasks();
     return;
   }
-  if (email.status === "banned") {
-    task.status = "failed";
-    task.error = "邮箱已标记封号，跳过任务";
+  const blockedReason = exactWorkspaceBlockReason(task.email || email.email, task.workspaceIds);
+  if (blockedReason) {
+    task.status = "canceled";
+    task.error = blockedReason;
     task.finishedAt = nowIso();
     task.updatedAt = nowIso();
-    appendLog(task, "error", task.error);
+    appendLog(task, "warn", `该邮箱当前 workspace 已标记 403 死号，任务跳过: ${blockedReason}`);
     await persistTasks();
     return;
   }
-
   task.status = "running";
   task.startedAt = nowIso();
   task.updatedAt = nowIso();
@@ -5935,7 +6680,7 @@ async function runTask(task: K12Task): Promise<void> {
           appendLog(task, "info", `Sub2API OAuth URL 已生成: ${prepared.groupLabel}`);
           const callbackUrl = await loginViaSub2ApiAuthorizeUrl(client, prepared.oauthUrl, task);
           appendLog(task, "info", "OAuth callback 已获取，交给 Sub2API exchange-code");
-          const accountName = `${email.email}---${primaryGroupName}`;
+          const accountName = sub2ApiOAuthAccountName(email, primaryGroupName, task.workspaceIds);
           const created = await sub2api.exchangeCallbackAndCreateAccount(
             prepared,
             callbackUrl,
@@ -5990,6 +6735,7 @@ async function runTask(task: K12Task): Promise<void> {
       });
     }
 
+    assertNotCanceled(task);
     task.status = "success";
     email.status = "success";
     appendLog(task, "ok", "任务完成");
@@ -5998,10 +6744,27 @@ async function runTask(task: K12Task): Promise<void> {
     if (email.otpMode === "smsbower-mail" && isSmsBowerActivationCanceledMessage(message)) {
       message = smsBowerClosedByRemoteStatusReason(email);
     }
+    const userAlreadyExists = isOpenAiUserAlreadyExistsMessage(message);
     task.status = task.cancelRequested ? "canceled" : "failed";
     task.error = message;
-    if (isOpenAiAccountBannedMessage(message)) {
+    if (isOpenAiWorkspaceAccessDeniedMessage(message)) {
+      await blockEmailWorkspace({
+        email: task.email || email.email,
+        workspaceIds: task.workspaceIds,
+        reason: message,
+        source: "k12-task",
+        accountName: task.sub2apiAccount || email.sub2apiAccount,
+      });
+      email.status = task.status === "canceled" ? "free" : "failed";
+      email.lastError = message;
+    } else if (isOpenAiAccountBannedMessage(message)) {
       markEmailBanned(email, message, task);
+    } else if (shouldMarkPoolRootUnusableAfterUserAlreadyExists({
+      isSmsBowerMail: email.otpMode === "smsbower-mail",
+      isChildEmail: Boolean(email.parentEmail),
+      userAlreadyExists,
+    })) {
+      markEmailRegistrationExhausted(email, `OpenAI user_already_exists，邮箱已存在或达到注册上限: ${email.email}`, task);
     } else {
       email.status = task.status === "canceled" ? "free" : "failed";
       email.lastError = message;
@@ -6048,6 +6811,16 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     await persistTasks();
     return;
   }
+  const blockedReason = exactWorkspaceBlockReason(task.email || email.email, task.workspaceIds);
+  if (blockedReason) {
+    task.status = "canceled";
+    task.error = blockedReason;
+    task.finishedAt = nowIso();
+    task.updatedAt = nowIso();
+    appendLog(task, "warn", `该邮箱当前 workspace 已标记 403 死号，AT 修复跳过: ${blockedReason}`);
+    await persistTasks();
+    return;
+  }
 
   task.status = "running";
   task.startedAt = nowIso();
@@ -6063,7 +6836,7 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
 
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
-    const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName);
+    const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName, task.workspaceIds);
     appendLog(task, "info", `按名称查找 Sub2API 账号: ${names.join(" / ")}`);
     const matchedAccounts = await findSub2ApiAccountsByName(origin, adminToken, names);
     const account = matchedAccounts[0];
@@ -6078,6 +6851,7 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
       task.sub2apiAccount = createdName;
       email.sub2apiAccount = createdName;
       await tryWriteAccountJsonFile(task, email, newAccessToken, {accountName: createdName, source: "gpt-k12-at-repair-create"});
+      assertNotCanceled(task);
       task.status = "success";
       email.status = "success";
       appendLog(task, "ok", `Sub2API 未有旧账号，已新增账号: ${createdName}`);
@@ -6097,7 +6871,19 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
       const local = await testOpenAiAccessToken(oldAccessToken);
       appendLog(task, local.ok ? "ok" : "warn", `当前 AT 在线检验: ${local.message}`);
       if (local.banned) {
-        markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止 AT 修复", task);
+        if (isOpenAiWorkspaceAccessDeniedMessage(local.message)) {
+          await blockEmailWorkspace({
+            email: task.email || email.email,
+            workspaceIds: task.workspaceIds,
+            reason: local.message,
+            source: "at-repair-local-check",
+            accountName,
+          });
+          task.error = "OpenAI 403 workspace access denied，停止 AT 修复";
+          appendLog(task, "error", task.error);
+        } else {
+          markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止 AT 修复", task);
+        }
         task.status = "failed";
         return;
       }
@@ -6119,6 +6905,19 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
 
     const sub2apiTest = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
     appendLog(task, sub2apiTest.ok ? "ok" : "warn", `Sub2API 账号测活: ${sub2apiTest.message}`);
+    if (sub2apiTest.banned) {
+      await blockEmailWorkspace({
+        email: task.email || email.email,
+        workspaceIds: task.workspaceIds,
+        reason: sub2apiTest.message,
+        source: "at-repair-sub2api-check",
+        accountName,
+      });
+      task.error = "OpenAI 403 workspace access denied，停止 AT 修复";
+      appendLog(task, "error", task.error);
+      task.status = "failed";
+      return;
+    }
     if (sub2apiTest.ok && oldAccessToken) {
       recordAccessToken(task, email, oldAccessToken);
       await tryWriteAccountJsonFile(task, email, oldAccessToken, {
@@ -6154,7 +6953,17 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     const message = normalizeFlowError(error);
     task.status = task.cancelRequested ? "canceled" : "failed";
     task.error = message;
-    if (isOpenAiAccountBannedMessage(message)) {
+    if (isOpenAiWorkspaceAccessDeniedMessage(message)) {
+      await blockEmailWorkspace({
+        email: task.email || email.email,
+        workspaceIds: task.workspaceIds,
+        reason: message,
+        source: "at-repair-error",
+        accountName: task.sub2apiAccount || email.sub2apiAccount,
+      });
+      email.status = task.status === "canceled" ? "free" : "failed";
+      email.lastError = message;
+    } else if (isOpenAiAccountBannedMessage(message)) {
       markEmailBanned(email, message, task);
     } else {
       email.status = task.status === "canceled" ? "free" : "failed";
@@ -6172,10 +6981,42 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
   }
 }
 
+function taskNotBeforeMs(task: K12Task): number {
+  if (!task.notBefore) return 0;
+  const value = Date.parse(task.notBefore);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function taskReadyToRun(task: K12Task, nowMs: number): boolean {
+  const notBeforeMs = taskNotBeforeMs(task);
+  return !notBeforeMs || notBeforeMs <= nowMs;
+}
+
+function armNextTaskScheduleWakeup(nowMs = Date.now()): void {
+  if (taskScheduleTimer) {
+    clearTimeout(taskScheduleTimer);
+    taskScheduleTimer = undefined;
+  }
+  let nextAt = 0;
+  for (const task of tasks) {
+    if (task.status !== "queued" || task.cancelRequested) continue;
+    const notBeforeMs = taskNotBeforeMs(task);
+    if (notBeforeMs <= nowMs) continue;
+    nextAt = nextAt ? Math.min(nextAt, notBeforeMs) : notBeforeMs;
+  }
+  if (!nextAt) return;
+  taskScheduleTimer = setTimeout(() => {
+    taskScheduleTimer = undefined;
+    scheduleTasks();
+  }, Math.max(1, nextAt - nowMs));
+}
+
 function scheduleTasks(): void {
   const limit = Math.max(1, appConfig.taskConcurrency);
+  const nowMs = Date.now();
   for (const task of tasks) {
     if (task.status !== "queued") continue;
+    if (!taskReadyToRun(task, nowMs)) continue;
     const email = emails.find((item) => item.id === task.emailId);
     if (email?.status === "banned") {
       task.status = "failed";
@@ -6185,10 +7026,19 @@ function scheduleTasks(): void {
       appendLog(task, "error", task.error);
       continue;
     }
+    const blockedReason = email ? exactWorkspaceBlockReason(task.email || email.email, task.workspaceIds) : "";
+    if (blockedReason) {
+      task.status = "canceled";
+      task.error = blockedReason;
+      task.finishedAt = nowIso();
+      task.updatedAt = nowIso();
+      appendLog(task, "warn", `该邮箱当前 workspace 已标记 403 死号，队列任务跳过: ${blockedReason}`);
+      continue;
+    }
     if (shouldSkipDuplicateQueuedTask({
       taskKind: task.kind || "k12",
       taskStatus: task.status,
-      hasPriorSuccess: hasPriorSuccessfulK12Task(task.emailId, task.id),
+      hasPriorSuccess: hasPriorSuccessfulK12Task(task.emailId, task.id, task.workspaceIds),
     })) {
       task.status = "canceled";
       task.error = "该邮箱已有成功任务，跳过重复队列任务";
@@ -6206,6 +7056,7 @@ function scheduleTasks(): void {
     const task = tasks.find((item) => (
       item.status === "queued"
       && !item.cancelRequested
+      && taskReadyToRun(item, Date.now())
       && emails.find((email) => email.id === item.emailId)?.status !== "banned"
       && !activeRoots.has(rootMailboxIdentityByEmailId(item.emailId))
     ));
@@ -6214,6 +7065,7 @@ function scheduleTasks(): void {
     activeWorkers += 1;
     void (task.kind === "at-repair" ? runAtRepairTask(task) : runTask(task));
   }
+  armNextTaskScheduleWakeup();
 }
 
 function enqueueK12Task(
@@ -6231,6 +7083,7 @@ function enqueueK12Task(
     smsBowerReplacementSourceTaskId?: string;
     smsBowerBatchId?: string;
     smsBowerBatchTargetSuccesses?: number;
+    notBefore?: string;
   },
 ): K12Task {
   const task: K12Task = {
@@ -6251,6 +7104,7 @@ function enqueueK12Task(
     smsBowerReplacementSourceTaskId: options.smsBowerReplacementSourceTaskId,
     smsBowerBatchId: options.smsBowerBatchId,
     smsBowerBatchTargetSuccesses: options.smsBowerBatchTargetSuccesses,
+    notBefore: options.notBefore,
     createdAt: nowIso(),
     updatedAt: nowIso(),
     workspaceResults: [],
@@ -6327,7 +7181,7 @@ async function enqueueReplacementSmsBowerMailTask(email: EmailRecord, sourceTask
   return task;
 }
 
-type TaskCreateSkipReason = "missing" | "smsbowerClosed" | "googleSsoUnsupported" | "running" | "banned" | "success" | "active";
+type TaskCreateSkipReason = "missing" | "smsbowerClosed" | "googleSsoUnsupported" | "running" | "banned" | "success" | "active" | "workspaceBlocked";
 
 function addTaskCreateSkipReason(reasons: Partial<Record<TaskCreateSkipReason, number>>, reason: TaskCreateSkipReason, count = 1): void {
   reasons[reason] = (reasons[reason] || 0) + count;
@@ -6350,7 +7204,10 @@ async function createTasks(body: Record<string, unknown>): Promise<{
   const dynamicGmailMode = !requestedEmailIds.length && appConfig.smsBowerMailEnabled;
   let selectedEmails = requestedEmailIds.length
     ? emails.filter((item) => requested.has(item.id))
-    : emails.filter((item) => item.status === "free");
+    : emails.filter((item) => shouldAutoSelectEmailForK12Launch({
+      emailStatus: item.status,
+      isChildEmail: Boolean(item.parentEmail),
+    }));
   const defaultLimit = dynamicGmailMode ? 1 : selectedEmails.length || 1;
   const limit = asNumber(body.count, defaultLimit, 1, 500);
   if (dynamicGmailMode) {
@@ -6364,64 +7221,106 @@ async function createTasks(body: Record<string, unknown>): Promise<{
   const sub2apiNoRtMode = runSub2Api && asBoolean(body.sub2apiNoRtMode, appConfig.sub2apiNoRtMode);
   const runWorkspaceJoin = sub2apiNoRtMode ? true : asBoolean(body.runWorkspaceJoin, appConfig.runWorkspaceJoin);
   const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
+  const workspaceLaunchMode = normalizeWorkspaceLaunchMode(body.workspaceLaunchMode);
   const created: K12Task[] = [];
   let skippedRunning = 0;
   const smsBowerBatchId = dynamicGmailMode && appConfig.gmailMailProvider === "smsbower"
     ? `smsbatch_${Date.now()}_${randomUUID().slice(0, 8)}`
     : undefined;
 
+  const launchVariantCount = workspaceLaunchMode === "random-one" ? 1 : workspaceTaskVariantsForLaunch({workspaceCandidates, workspaceLaunchMode}).length;
+  const totalTaskTarget = selectedEmails.slice(0, limit).length * launchVariantCount;
+
   for (const email of selectedEmails.slice(0, limit)) {
+    const eligibleRandomWorkspaceCandidates = workspaceLaunchMode === "random-one"
+      ? workspaceCandidates.filter((workspaceId) => {
+        const taskWorkspaceIds = workspaceId ? [workspaceId] : [];
+        if (exactWorkspaceBlockReason(email.email, taskWorkspaceIds)) return false;
+        return !taskCreationSkipReason({
+          emailStatus: email.status,
+          hasActiveTask: hasActiveTask(email.id, taskWorkspaceIds),
+          hasPriorSuccess: hasPriorSuccessfulK12Task(email.id, "", taskWorkspaceIds),
+        });
+      })
+      : [];
+    const workspaceTaskVariants = workspaceLaunchMode === "random-one"
+      ? (
+        workspaceCandidates.length > 0 && eligibleRandomWorkspaceCandidates.length === 0
+          ? []
+          : workspaceTaskVariantsForLaunch({
+            workspaceCandidates: eligibleRandomWorkspaceCandidates,
+            workspaceLaunchMode,
+            randomIndex: randomInt(0, Math.max(1, eligibleRandomWorkspaceCandidates.length || 1)),
+          })
+      )
+      : workspaceTaskVariantsForLaunch({workspaceCandidates, workspaceLaunchMode});
     const smsBowerBlockedReason = smsBowerActivationBlockReason(email);
     if (smsBowerBlockedReason) {
       email.status = "failed";
       email.lastError = smsBowerBlockedReason;
       email.updatedAt = nowIso();
-      skippedRunning += 1;
-      addTaskCreateSkipReason(skippedReasons, "smsbowerClosed");
+      skippedRunning += workspaceTaskVariants.length;
+      addTaskCreateSkipReason(skippedReasons, "smsbowerClosed", workspaceTaskVariants.length);
       continue;
     }
     if (email.otpMode === "smsbower-mail" && isGoogleSsoUnsupportedMessage(email.lastError)) {
       email.status = "failed";
       email.updatedAt = nowIso();
-      skippedRunning += 1;
-      addTaskCreateSkipReason(skippedReasons, "googleSsoUnsupported");
+      skippedRunning += workspaceTaskVariants.length;
+      addTaskCreateSkipReason(skippedReasons, "googleSsoUnsupported", workspaceTaskVariants.length);
       continue;
     }
-    const skipReason = taskCreationSkipReason({emailStatus: email.status, hasActiveTask: hasActiveTask(email.id)});
-    if (skipReason) {
-      skippedRunning += 1;
-      addTaskCreateSkipReason(skippedReasons, skipReason);
+    if (!workspaceTaskVariants.length) {
+      skippedRunning += launchVariantCount;
+      addTaskCreateSkipReason(skippedReasons, "active", launchVariantCount);
       continue;
     }
-    const pickedWorkspaceId = randomItem(workspaceCandidates);
-    const taskWorkspaceIds = pickedWorkspaceId ? [pickedWorkspaceId] : [];
-    const task = enqueueK12Task(email, {
-      route,
-      workspaceIds: taskWorkspaceIds,
-      runWorkspaceJoin,
-      runSub2Api,
-      sub2apiNoRtMode,
-      sub2apiGroupName,
-      fissionRemainingAfterThis: poolFissionRemainingForNewTask({
-        enabled: appConfig.smsBowerGmailFissionEnabled,
-        count: appConfig.smsBowerGmailFissionCount,
-        isChildEmail: Boolean(email.parentEmail),
-        isSmsBowerMail: email.otpMode === "smsbower-mail",
-        existingRemaining: email.smsBowerFissionChildrenRemaining,
-      }),
-      smsBowerAutoReplaceOnFailure: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower",
-      smsBowerReplacementRemaining: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower"
-        ? DEFAULT_SMSBOWER_AUTO_REPLACEMENT_LIMIT
-        : undefined,
-      smsBowerBatchId,
-      smsBowerBatchTargetSuccesses: smsBowerBatchId ? limit : undefined,
-    });
-    appendLog(
-      task,
-      "info",
-      `已排队: ${email.email}${workspaceCandidates.length > 1 && pickedWorkspaceId ? `，随机 workspace=${pickedWorkspaceId}` : ""}`,
-    );
-    created.push(task);
+    for (const workspaceId of workspaceTaskVariants) {
+      const taskWorkspaceIds = workspaceId ? [workspaceId] : [];
+      const blockedReason = exactWorkspaceBlockReason(email.email, taskWorkspaceIds);
+      if (blockedReason) {
+        skippedRunning += 1;
+        addTaskCreateSkipReason(skippedReasons, "workspaceBlocked");
+        continue;
+      }
+      const skipReason = taskCreationSkipReason({
+        emailStatus: email.status,
+        hasActiveTask: hasActiveTask(email.id, taskWorkspaceIds),
+        hasPriorSuccess: hasPriorSuccessfulK12Task(email.id, "", taskWorkspaceIds),
+      });
+      if (skipReason) {
+        skippedRunning += 1;
+        addTaskCreateSkipReason(skippedReasons, skipReason);
+        continue;
+      }
+      const task = enqueueK12Task(email, {
+        route,
+        workspaceIds: taskWorkspaceIds,
+        runWorkspaceJoin,
+        runSub2Api,
+        sub2apiNoRtMode,
+        sub2apiGroupName,
+        fissionRemainingAfterThis: poolFissionRemainingForNewTask({
+          enabled: appConfig.smsBowerGmailFissionEnabled,
+          count: appConfig.smsBowerGmailFissionCount,
+          isChildEmail: Boolean(email.parentEmail),
+          isSmsBowerMail: email.otpMode === "smsbower-mail",
+          existingRemaining: email.smsBowerFissionChildrenRemaining,
+        }),
+        smsBowerAutoReplaceOnFailure: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower",
+        smsBowerReplacementRemaining: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower"
+          ? DEFAULT_SMSBOWER_AUTO_REPLACEMENT_LIMIT
+          : undefined,
+        smsBowerBatchId,
+        smsBowerBatchTargetSuccesses: smsBowerBatchId ? totalTaskTarget : undefined,
+      });
+      appendLog(
+        task,
+        "info",
+        `已排队: ${email.email}${workspaceId ? `，workspace=${workspaceId}` : ""}`,
+      );
+      created.push(task);
+    }
   }
   void Promise.all([persistTasks(), persistEmails()]);
   scheduleTasks();
@@ -6481,9 +7380,12 @@ function retryTask(source: K12Task): K12Task {
   }
   const email = emails.find((item) => item.id === source.emailId);
   if (!email) throw new Error("邮箱记录不存在");
-  if (email.status === "running") throw new Error("该邮箱当前正在运行，不能重复重试");
-  if (email.status === "banned") throw new Error("该邮箱已标记封号，不能重试");
-  if (email.status === "success") throw new Error("该邮箱已成功，不需要重试");
+  const blockedReason = exactWorkspaceBlockReason(source.email || email.email, source.workspaceIds);
+  if (blockedReason) throw new Error(`该邮箱当前 workspace 已标记 403 死号，不能重试: ${blockedReason}`);
+  if (hasActiveTask(email.id, source.workspaceIds)) throw new Error("该邮箱当前 workspace 已有任务，不能重复重试");
+  if ((source.kind || "k12") === "k12" && hasPriorSuccessfulK12Task(email.id, source.id, source.workspaceIds)) {
+    throw new Error("该邮箱当前 workspace 已成功，不需要重试");
+  }
   const smsBowerBlockedReason = smsBowerActivationBlockReason(email);
   if (smsBowerBlockedReason) {
     email.status = "failed";
@@ -6546,6 +7448,34 @@ function retryFailedTasks(): {created: K12Task[]; skipped: number; failed: Array
   return {created, skipped, failed};
 }
 
+function cancelTaskNow(task: K12Task, reason: string): void {
+  const previousStatus = task.status;
+  task.cancelRequested = true;
+  cancelManualEmailOtp(task.id, "任务已取消，手动验证码等待结束");
+  task.waitingOtp = false;
+  task.waitingOtpLabel = undefined;
+  task.waitingOtpEmail = undefined;
+  task.waitingOtpSince = undefined;
+  task.status = taskStatusAfterCancelRequest(task.status);
+  task.updatedAt = nowIso();
+  if (task.status === "canceled" && previousStatus !== "canceled") {
+    task.finishedAt = nowIso();
+    appendLog(task, "warn", reason);
+  } else {
+    appendLog(task, "warn", "已请求取消，正在快速停止当前任务");
+  }
+}
+
+function cancelActiveTasks(reason = "一键停止，任务已取消"): {canceled: number} {
+  let canceled = 0;
+  for (const task of tasks) {
+    if (!shouldCancelActiveTaskStatus(task.status)) continue;
+    cancelTaskNow(task, reason);
+    canceled += 1;
+  }
+  return {canceled};
+}
+
 function clearFailedTasks(): {removed: number} {
   const failedTasks = tasks.filter((task) => task.status === "failed");
   if (!failedTasks.length) return {removed: 0};
@@ -6562,10 +7492,15 @@ function clearFailedTasks(): {removed: number} {
 
 function publicTask(task: K12Task): Record<string, unknown> {
   const email = emails.find((item) => item.id === task.emailId);
+  const rootEmail = email ? rootMailboxIdentity(email) : task.email.toLowerCase();
+  const workspaceBlockReason = exactWorkspaceBlockReason(task.email || email?.email || rootEmail, task.workspaceIds);
   return {
     ...task,
     parentEmail: email?.parentEmail,
+    rootEmail,
     otpMode: email?.otpMode || "auto",
+    workspaceBlocked: Boolean(workspaceBlockReason),
+    workspaceBlockReason: workspaceBlockReason || undefined,
     smsBowerMailRoot: email?.smsBowerMailRoot,
     smsBowerFissionChildrenRemaining: email?.smsBowerFissionChildrenRemaining,
     smsBowerFissionParentEmailId: email?.smsBowerFissionParentEmailId,
@@ -6597,7 +7532,7 @@ function summary(): Record<string, unknown> {
 }
 
 function reconcileEmailStatusesFromTasks(): boolean {
-  let changed = false;
+  let changed = restoreWorkspaceAccessDeniedEmailStatuses();
   for (const email of emails) {
     if (email.status === "banned") continue;
     if (email.otpMode === "smsbower-mail" && isGoogleSsoUnsupportedMessage(email.lastError)) {
@@ -6676,9 +7611,13 @@ function reconcileEmailStatusesFromTasks(): boolean {
 }
 
 async function reconcileAndPersistEmailStatuses(): Promise<boolean> {
+  const seededBlocks = seedWorkspaceBlocksFromAccessDeniedTasks();
   const changed = reconcileEmailStatusesFromTasks();
-  if (changed) await persistEmails();
-  return changed;
+  await Promise.all([
+    seededBlocks ? persistWorkspaceBlocks() : Promise.resolve(),
+    changed ? persistEmails() : Promise.resolve(),
+  ]);
+  return seededBlocks || changed;
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -6860,11 +7799,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       return;
     }
     await saveConfig(merged);
-    sendJson(res, 200, {config: publicConfig()});
+    const canceledStaleWorkspaceTasks = cancelTasksOutsideConfiguredWorkspaces("workspace 已从配置删除，任务已取消", merged.workspaceIds);
+    if (canceledStaleWorkspaceTasks) await persistTasks();
+    sendJson(res, 200, {config: publicConfig(), canceledStaleWorkspaceTasks});
     return;
   }
 
   if (method === "GET" && pathname === "/api/emails") {
+    await normalizeAndPersistPoolUserAlreadyExistsCooldownRecords();
     await reconcileAndPersistEmailStatuses();
     sendJson(res, 200, {items: emails.map(publicEmail), count: emails.length});
     return;
@@ -6894,7 +7836,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       ids = emails.filter((item) => item.status === status).map((item) => item.id);
     }
     const result = removeEmails(ids);
-    await persistEmails();
+    await Promise.all([persistEmails(), result.removedTasks ? persistTasks() : Promise.resolve()]);
     sendJson(res, 200, result);
     return;
   }
@@ -6927,14 +7869,25 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   if (method === "DELETE" && pathname.startsWith("/api/emails/")) {
     const id = decodeURIComponent(pathname.split("/").pop() || "");
     const result = removeEmails([id]);
-    await persistEmails();
+    await Promise.all([persistEmails(), result.removedTasks ? persistTasks() : Promise.resolve()]);
     sendJson(res, 200, result);
     return;
   }
 
   if (method === "GET" && pathname === "/api/tasks") {
+    await reconcileAndPersistEmailStatuses();
+    await normalizeAndPersistPoolUserAlreadyExistsCooldownRecords();
     if (await hydrateTaskAccessTokensFromTokenOut()) await persistTasks();
-    sendJson(res, 200, {items: tasks.map(publicTask).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))), count: tasks.length});
+    const pruned = pruneTasksWithoutEmailRecords(emails, tasks);
+    if (pruned.removedTasks) {
+      tasks = pruned.tasks;
+      await persistTasks();
+    }
+    sendJson(res, 200, {
+      items: tasks.map(publicTask).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))),
+      count: tasks.length,
+      workspaceBlocks,
+    });
     return;
   }
 
@@ -6998,6 +7951,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (method === "POST" && pathname === "/api/tasks/cancel-active") {
+    const result = cancelActiveTasks();
+    await persistTasks();
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (method === "POST" && pathname === "/api/tasks/fission-top-up") {
     try {
       const body = await readJsonBody(req);
@@ -7022,19 +7982,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       return;
     }
     if (method === "POST" && taskMatch[2] === "cancel") {
-      task.cancelRequested = true;
-      cancelManualEmailOtp(task.id, "任务已取消，手动验证码等待结束");
-      task.waitingOtp = false;
-      task.waitingOtpLabel = undefined;
-      task.waitingOtpEmail = undefined;
-      task.waitingOtpSince = undefined;
-      if (task.status === "queued") {
-        task.status = "canceled";
-        task.finishedAt = nowIso();
-        appendLog(task, "warn", "任务已取消");
-      } else {
-        appendLog(task, "warn", "已请求取消，正在快速停止当前任务");
-      }
+      cancelTaskNow(task, "任务已取消");
       await persistTasks();
       sendJson(res, 200, {task: publicTask(task)});
       return;
@@ -7112,6 +8060,8 @@ async function boot(): Promise<void> {
   await ensureSentinelSdk();
   emails = await readJson<EmailRecord[]>(emailsFile, []);
   tasks = await readJson<K12Task[]>(tasksFile, []);
+  workspaceBlocks = (await readJson<WorkspaceBlockRecord[]>(workspaceBlocksFile, []))
+    .filter((item) => item && typeof item === "object" && asString(item.rootEmail) && asString(item.workspaceId));
   sub2apiRefillHistory = (await readJson<Sub2ApiRefillHistoryEntry[]>(sub2apiRefillHistoryFile, []))
     .filter((item) => item && typeof item === "object" && asString(item.id) && asString(item.checkedAt))
     .slice(0, 200);
@@ -7127,7 +8077,9 @@ async function boot(): Promise<void> {
       appendLog(task, "warn", "服务重启，未完成任务已标记失败");
     }
   }
+  cancelTasksOutsideConfiguredWorkspaces("workspace 已从配置删除，任务已取消");
   await hydrateTaskAccessTokensFromTokenOut();
+  await normalizeAndPersistPoolUserAlreadyExistsCooldownRecords();
   await persistTasks();
   await reconcileAndPersistEmailStatuses();
 

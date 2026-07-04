@@ -33,6 +33,17 @@ export function isRecoverableWorkspaceSelectError(message: string): boolean {
   return /invalid_state|invalid_auth_step|sign-in session is no longer valid|no_valid_workspaces/i.test(message);
 }
 
+export function isUnavailableWorkspaceSelectError(status: number, body: string): boolean {
+  if (!status) return false;
+  return /invalid_workspace_selected|no_valid_workspaces/i.test(body);
+}
+
+export function removeWorkspaceId(workspaceIds: string[], unavailableWorkspaceId: string): string[] {
+  const target = unavailableWorkspaceId.trim().toLowerCase();
+  if (!target) return [...workspaceIds];
+  return workspaceIds.filter((item) => item.trim().toLowerCase() !== target);
+}
+
 interface AuthSessionWorkspace {
   id?: unknown;
   kind?: unknown;

@@ -3,10 +3,12 @@ import {test} from "node:test";
 
 import {
   authWorkspaceSelectionCandidates,
+  isUnavailableWorkspaceSelectError,
   isRecoverableWorkspaceSwitchAuthStep,
   isRecoverableWorkspaceSelectError,
   isSameDomainWorkspaceError,
   mergeWorkspaceFallbackIds,
+  removeWorkspaceId,
   shouldRetryK12Invite,
 } from "./k12Workspace";
 
@@ -76,4 +78,16 @@ test("no valid workspaces from workspace select is recoverable by refreshing aut
   assert.equal(isRecoverableWorkspaceSelectError('{"code":"no_valid_workspaces"}'), true);
   assert.equal(isRecoverableWorkspaceSelectError("invalid_state"), true);
   assert.equal(isRecoverableWorkspaceSelectError("invalid_workspace_selected"), false);
+});
+
+test("detects workspace select errors that invalidate a configured workspace id", () => {
+  assert.equal(isUnavailableWorkspaceSelectError(401, '{"code":"invalid_workspace_selected"}'), true);
+  assert.equal(isUnavailableWorkspaceSelectError(400, '{"code":"no_valid_workspaces"}'), true);
+  assert.equal(isUnavailableWorkspaceSelectError(401, '{"code":"invalid_state"}'), false);
+  assert.equal(isUnavailableWorkspaceSelectError(0, "network timeout"), false);
+});
+
+test("removes unavailable workspace ids case-insensitively while preserving the rest", () => {
+  assert.deepEqual(removeWorkspaceId(["A", "b", "C"], "B"), ["A", "C"]);
+  assert.deepEqual(removeWorkspaceId(["A", "C"], "missing"), ["A", "C"]);
 });

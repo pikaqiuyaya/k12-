@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import {test} from "node:test";
 
 import {
+  isTerminalK12AccessDeniedMessage,
   shouldCreateAutoAtRepairTask,
   isAutoAtRepairIssue,
   isK12AccountContext,
   sub2ApiAccountEmailCandidatesFromName,
+  sub2ApiK12LivenessIssue,
   sub2ApiK12StatusErrorReason,
 } from "./sub2ApiAccountRepair";
 
@@ -95,4 +97,51 @@ test("auto AT repair only queues matched idle K12 repair issues", () => {
     emailStatus: "running",
     hasActiveTask: false,
   }), false);
+});
+
+test("auto AT repair skips terminal OpenAI workspace access denied errors", () => {
+  const message = 'Sub2API test failed: API returned 403: {"detail":{"message":"Unauthorized: Contact your ChatGPT workspace administrator for access.","code":"codex_workspace_access_denied"}}';
+
+  assert.equal(isTerminalK12AccessDeniedMessage(message), true);
+  assert.match(sub2ApiK12StatusErrorReason({
+    planType: "k12",
+    status: "temporary_cooldown",
+    errorMessage: message,
+    workspaceIds,
+  }) || "", /codex_workspace_access_denied|workspace administrator/);
+  assert.equal(shouldCreateAutoAtRepairTask({
+    issue: "sub2api-k12-status-error",
+    matchedLocalEmail: true,
+    emailStatus: "success",
+    hasActiveTask: false,
+    message,
+  }), false);
+});
+
+test("Sub2API liveness workspace 403 becomes terminal K12 sync issue", () => {
+  const issue = sub2ApiK12LivenessIssue({
+    planMismatch: undefined,
+    liveness: {
+      ok: false,
+      status: 403,
+      message: 'Sub2API 测活失败: Access forbidden (403): {"message":"Unauthorized: Contact your ChatGPT workspace administrator for access.","code":"codex_workspace_access_denied"}',
+      latencyMs: 800,
+      banned: true,
+    },
+  });
+
+  assert.equal(issue?.issue, "sub2api-k12-status-error");
+  assert.equal(issue?.repairable, false);
+  assert.match(issue?.message || "", /codex_workspace_access_denied|workspace administrator/);
+
+  assert.equal(sub2ApiK12LivenessIssue({
+    planMismatch: "plan=free",
+    liveness: {
+      ok: false,
+      status: 403,
+      message: 'codex_workspace_access_denied',
+      latencyMs: 800,
+      banned: true,
+    },
+  }), null);
 });
