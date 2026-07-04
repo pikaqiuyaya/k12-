@@ -20,6 +20,7 @@ export interface TaskGroupInput {
   smsBowerBatchTargetSuccesses?: number;
   workspaceIds: string[];
   workspaceResults: Array<{ok: boolean}>;
+  logs?: Array<{message?: string}>;
 }
 
 export interface TaskGroupRow<T extends TaskGroupInput = TaskGroupInput> {
@@ -126,6 +127,12 @@ function uniqueChildEmails<T extends TaskGroupInput>(items: T[], status?: string
   return out;
 }
 
+function hasSmsBowerCodeLimitStop<T extends TaskGroupInput>(items: T[]): boolean {
+  return items.some((item) => (item.logs || []).some((log) => (
+    /maximum number of codes reached|code limit|验证码.*上限|次数.*上限/i.test(String(log.message || ""))
+  )));
+}
+
 function fissionTarget<T extends TaskGroupInput>(items: T[], successfulChildren: number, attemptChildren: number, source: TaskGroupSource, minimumTargetChildren = 0): number {
   const counters = items
     .map((item) => item.smsBowerFissionRemainingAfterThis)
@@ -139,6 +146,7 @@ function fissionTarget<T extends TaskGroupInput>(items: T[], successfulChildren:
   const hasFissionHistory = items.some((item) => isChildTask(item) || hasFissionCounter(item));
   const configuredTarget = hasFissionHistory ? Math.max(0, Math.floor(minimumTargetChildren || 0)) : 0;
   if (source === "sms") {
+    if (hasSmsBowerCodeLimitStop(items)) return Math.max(successfulChildren, attemptChildren);
     if (currentRemaining.length) {
       const attemptedChildren = Math.max(attemptChildren, successfulChildren);
       const stoppedAtCurrentLimit = currentRemaining.some((value) => Math.max(0, Math.floor(value)) <= 0);

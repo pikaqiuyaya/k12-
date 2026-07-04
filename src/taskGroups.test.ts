@@ -121,6 +121,38 @@ test("treats SMSBower code limit stop as a successful completed group with the a
   assert.equal(rows[0].fissionTargetChildren, 1);
 });
 
+test("treats historical SMSBower code limit logs as a completed group even when the mother email record is missing", () => {
+  const rows = buildTaskGroups([
+    task({
+      id: "sms-root",
+      email: "smsroot@gmail.com",
+      status: "success",
+      otpMode: "auto",
+      smsBowerFissionRemainingAfterThis: 5,
+    }),
+    task({
+      id: "sms-child",
+      email: "smsroot+aa@gmail.com",
+      parentEmail: "smsroot@gmail.com",
+      status: "success",
+      otpMode: "smsbower-mail",
+      smsBowerMailRoot: "smsroot@gmail.com",
+      smsBowerFissionRemainingAfterThis: 4,
+      logs: [
+        {
+          message: "SMSBower Gmail 裂变子任务创建失败: SMSBower setStatus 失败: Maximum number of codes reached",
+        },
+      ],
+    }),
+  ], {minimumTargetChildren: 5});
+
+  assert.equal(rows[0].source, "sms");
+  assert.equal(rows[0].status, "success");
+  assert.equal(rows[0].fissionSuccessChildren, 1);
+  assert.equal(rows[0].fissionTargetChildren, 1);
+  assert.equal(canTopUpTaskGroupFission(rows[0]), false);
+});
+
 test("allows top-up fission for ordinary mailbox-pool and reusable SMSBower groups", () => {
   const [pool] = buildTaskGroups([
     task({id: "root", email: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 5}),
