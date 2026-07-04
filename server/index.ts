@@ -2186,6 +2186,7 @@ async function createFissionTopUpTask(body: Record<string, unknown>): Promise<{
   if (parent.status === "banned") throw new Error(`母号已标记 GPT 封号，不能继续补分裂: ${root}`);
   const relatedTasks = relatedK12TasksForRoot(root);
   const hasSmsBowerHistory = hasSmsBowerFissionHistory({tasks: relatedTasks, emails});
+  const useSmsBowerTopUp = parent.otpMode === "smsbower-mail" || (hasSmsBowerHistory && Boolean(parent.smsBowerMailId));
   const blockReason = fissionTopUpBlockReason({otpMode: parent.otpMode, hasSmsBowerHistory});
   if (blockReason) throw new Error(blockReason);
 
@@ -2199,6 +2200,45 @@ async function createFissionTopUpTask(body: Record<string, unknown>): Promise<{
 
   const template = latestFissionTemplateTask(root);
   if (!template) throw new Error(`找不到可复用的母号任务配置: ${root}`);
+
+  if (useSmsBowerTopUp) {
+    const smsBowerBlockedReason = smsBowerActivationBlockReason(parent);
+    if (smsBowerBlockedReason) throw new Error(smsBowerBlockedReason);
+    try {
+      await requestSmsBowerNextMailCode(parent, template, "继续补分裂，已请求等待下一个验证码");
+    } catch (error) {
+      if (!isSmsBowerCodeLimitReachedMessage(error)) throw error;
+      parent.smsBowerFissionChildrenRemaining = 0;
+      parent.updatedAt = nowIso();
+      appendLog(template, "ok", `SMSBower activation=${parent.smsBowerMailId || "-"} 验证码次数已达上限，按当前成功子号 ${successfulChildren} 个结束分裂`);
+      return {
+        created: [],
+        rootEmail: root,
+        targetSuccesses: successfulChildren,
+        successfulChildren,
+        deficit: 0,
+        activeTasks,
+      };
+    }
+
+    const child = createSmsBowerFissionChild(parent);
+    const nextRemaining = fissionTopUpRemainingAfterThis(deficit);
+    const childTask = enqueueK12Task(child, {
+      route: template.route,
+      workspaceIds: template.workspaceIds,
+      runWorkspaceJoin: template.runWorkspaceJoin,
+      runSub2Api: template.runSub2Api,
+      sub2apiNoRtMode: template.sub2apiNoRtMode === true,
+      sub2apiGroupName: template.sub2apiGroupName,
+      fissionRemainingAfterThis: nextRemaining,
+    });
+    parent.smsBowerFissionChildrenRemaining = nextRemaining;
+    parent.smsBowerFissionChildrenCreatedAt = nowIso();
+    parent.updatedAt = nowIso();
+    appendLog(template, "info", `继续补 SMSBower 分裂: ${root} 当前 ${successfulChildren}/${targetSuccesses}，已创建补位子任务 ${child.email}，缺口 ${deficit}`);
+    appendLog(childTask, "info", `继续补 SMSBower 分裂创建，母邮箱 ${root}，复用 activation=${parent.smsBowerMailId || "-"}，目标 ${targetSuccesses}`);
+    return {created: [childTask], rootEmail: root, targetSuccesses, successfulChildren, deficit, activeTasks};
+  }
 
   const child = createPoolFissionChild(parent);
 

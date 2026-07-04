@@ -109,9 +109,9 @@ test("top-up fission only creates the missing chain length", () => {
   assert.equal(fissionTopUpDeficit({targetSuccesses: 5, successfulChildren: 4, activeTasks: 1}), 0);
 });
 
-test("top-up fission is blocked for dynamic mailbox providers", () => {
-  assert.equal(fissionTopUpBlockReason({otpMode: "smsbower-mail"}), "SMSBower Gmail 不参与继续补分裂");
-  assert.equal(fissionTopUpBlockReason({otpMode: "auto", hasSmsBowerHistory: true}), "SMSBower Gmail 不参与继续补分裂");
+test("top-up fission is allowed for reusable SMSBower activations and blocked for Emailnator", () => {
+  assert.equal(fissionTopUpBlockReason({otpMode: "smsbower-mail"}), undefined);
+  assert.equal(fissionTopUpBlockReason({otpMode: "auto", hasSmsBowerHistory: true}), undefined);
   assert.equal(fissionTopUpBlockReason({otpMode: "emailnator"}), "Emailnator 动态邮箱暂不支持继续补分裂");
   assert.equal(fissionTopUpBlockReason({otpMode: "auto"}), undefined);
   assert.equal(fissionTopUpBlockReason({otpMode: "manual"}), undefined);

@@ -61,7 +61,7 @@ test("uses the current configured fission target for historical groups", () => {
   assert.equal(rows[0].fissionTargetChildren, 5);
 });
 
-test("marks SMSBower fission groups as SMS and counts only existing SMS children", () => {
+test("marks reusable SMSBower fission groups as partial until the requested child target is reached", () => {
   const rows = buildTaskGroups([
     task({
       id: "sms-root",
@@ -70,6 +70,7 @@ test("marks SMSBower fission groups as SMS and counts only existing SMS children
       otpMode: "smsbower-mail",
       smsBowerMailRoot: "smsroot@gmail.com",
       smsBowerFissionRemainingAfterThis: 2,
+      smsBowerFissionChildrenRemaining: 1,
     }),
     task({
       id: "sms-child",
@@ -85,14 +86,14 @@ test("marks SMSBower fission groups as SMS and counts only existing SMS children
   assert.equal(rows.length, 1);
   assert.equal(rows[0].source, "sms");
   assert.equal(rows[0].sourceLabel, "SMS");
-  assert.equal(rows[0].status, "success");
+  assert.equal(rows[0].status, "partial");
   assert.equal(rows[0].fissionSuccessChildren, 1);
-  assert.equal(rows[0].fissionTargetChildren, 1);
+  assert.equal(rows[0].fissionTargetChildren, 2);
   assert.equal(rows[0].primaryTask.id, "sms-root");
-  assert.equal(canTopUpTaskGroupFission(rows[0]), false);
+  assert.equal(canTopUpTaskGroupFission(rows[0]), true);
 });
 
-test("does not apply the configured pool fission target to SMSBower groups", () => {
+test("treats SMSBower code limit stop as a successful completed group with the achieved child count", () => {
   const rows = buildTaskGroups([
     task({
       id: "sms-root",
@@ -101,6 +102,7 @@ test("does not apply the configured pool fission target to SMSBower groups", () 
       otpMode: "smsbower-mail",
       smsBowerMailRoot: "smsroot@gmail.com",
       smsBowerFissionRemainingAfterThis: 5,
+      smsBowerFissionChildrenRemaining: 0,
     }),
     task({
       id: "sms-child",
@@ -119,7 +121,7 @@ test("does not apply the configured pool fission target to SMSBower groups", () 
   assert.equal(rows[0].fissionTargetChildren, 1);
 });
 
-test("allows top-up fission only for ordinary mailbox-pool groups", () => {
+test("allows top-up fission for ordinary mailbox-pool and reusable SMSBower groups", () => {
   const [pool] = buildTaskGroups([
     task({id: "root", email: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 5}),
     task({id: "c1", email: "mother+one@gmail.com", parentEmail: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 4}),
@@ -127,6 +129,28 @@ test("allows top-up fission only for ordinary mailbox-pool groups", () => {
 
   assert.equal(pool.source, "pool");
   assert.equal(canTopUpTaskGroupFission(pool), true);
+
+  const [sms] = buildTaskGroups([
+    task({
+      id: "sms-root",
+      email: "smsroot@gmail.com",
+      status: "success",
+      otpMode: "smsbower-mail",
+      smsBowerMailRoot: "smsroot@gmail.com",
+      smsBowerFissionChildrenRemaining: 1,
+    }),
+    task({
+      id: "sms-c1",
+      email: "smsroot+one@gmail.com",
+      parentEmail: "smsroot@gmail.com",
+      status: "success",
+      otpMode: "smsbower-mail",
+      smsBowerMailRoot: "smsroot@gmail.com",
+    }),
+  ]);
+
+  assert.equal(sms.source, "sms");
+  assert.equal(canTopUpTaskGroupFission(sms), true);
 
   const [emailnator] = buildTaskGroups([
     task({id: "root", email: "mail@gmail.com", status: "success", otpMode: "emailnator", smsBowerFissionRemainingAfterThis: 5}),

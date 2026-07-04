@@ -90,6 +90,8 @@ function groupStatus<T extends TaskGroupInput>(items: T[], target: number, succe
   if (items.some((item) => item.status === "running")) return "running";
   if (items.some((item) => item.status === "queued")) return "queued";
   if (source === "sms") {
+    if (target > 0 && successfulChildren >= target) return "success";
+    if (target > 0 && successfulChildren > 0) return "partial";
     if (items.some((item) => item.status === "success")) return "success";
     if (items.some((item) => item.status === "failed")) return "failed";
     if (items.some((item) => item.status === "canceled")) return "canceled";
@@ -125,7 +127,6 @@ function uniqueChildEmails<T extends TaskGroupInput>(items: T[], status?: string
 }
 
 function fissionTarget<T extends TaskGroupInput>(items: T[], successfulChildren: number, attemptChildren: number, source: TaskGroupSource, minimumTargetChildren = 0): number {
-  if (source === "sms") return Math.max(successfulChildren, attemptChildren);
   const counters = items
     .map((item) => item.smsBowerFissionRemainingAfterThis)
     .filter((value): value is number => Number.isFinite(value));
@@ -137,6 +138,18 @@ function fissionTarget<T extends TaskGroupInput>(items: T[], successfulChildren:
   const maxCurrentTarget = currentRemaining.length ? Math.max(...currentRemaining.map((value) => value + successfulChildren)) : 0;
   const hasFissionHistory = items.some((item) => isChildTask(item) || hasFissionCounter(item));
   const configuredTarget = hasFissionHistory ? Math.max(0, Math.floor(minimumTargetChildren || 0)) : 0;
+  if (source === "sms") {
+    if (currentRemaining.length) {
+      const attemptedChildren = Math.max(attemptChildren, successfulChildren);
+      const stoppedAtCurrentLimit = currentRemaining.some((value) => Math.max(0, Math.floor(value)) <= 0);
+      const currentTarget = Math.max(...currentRemaining.map((value) => {
+        const remaining = Math.max(0, Math.floor(value));
+        return remaining > 0 ? remaining + attemptedChildren : attemptedChildren;
+      }));
+      return Math.max(currentTarget, successfulChildren, stoppedAtCurrentLimit ? 0 : configuredTarget);
+    }
+    return Math.max(maxTaskCounter, successfulChildren, attemptChildren, configuredTarget);
+  }
   return Math.max(maxTaskCounter, maxCurrentTarget, successfulChildren, configuredTarget);
 }
 
@@ -188,7 +201,7 @@ export function buildTaskGroups<T extends TaskGroupInput>(tasks: T[], options: T
 }
 
 export function canTopUpTaskGroupFission<T extends TaskGroupInput>(group: TaskGroupRow<T>): boolean {
-  if (group.source !== "pool") return false;
+  if (group.source === "emailnator") return false;
   if (group.fissionTargetChildren <= 0) return false;
   if (group.fissionSuccessChildren >= group.fissionTargetChildren) return false;
   return !group.tasks.some((task) => task.status === "queued" || task.status === "running");

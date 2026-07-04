@@ -49,7 +49,6 @@ export function fissionTopUpRemainingAfterThis(deficit: number): number {
 }
 
 export function fissionTopUpBlockReason(input: {otpMode?: EmailOtpMode; hasSmsBowerHistory?: boolean}): string | undefined {
-  if (input.otpMode === "smsbower-mail" || input.hasSmsBowerHistory) return "SMSBower Gmail 不参与继续补分裂";
   if (input.otpMode === "emailnator") return "Emailnator 动态邮箱暂不支持继续补分裂";
   return undefined;
 }
