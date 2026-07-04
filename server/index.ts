@@ -16,6 +16,7 @@ import {
 } from "./k12Workspace";
 import {
   isGoogleSsoUnsupportedMessage,
+  isOpenAiUserAlreadyExistsMessage,
   isSmsBowerCodeLimitReachedMessage,
   isSmsBowerActivationCanceledMessage,
   isWrongEmailOtpCodeMessage,
@@ -313,6 +314,7 @@ const DEFAULT_EMAILNATOR_BASE_URL = "https://www.emailnator.com";
 const DEFAULT_SMSBOWER_AUTO_REPLACEMENT_LIMIT = 1;
 const SMSBOWER_CODE_MAX_ATTEMPTS = 30;
 const POOL_FISSION_CHILD_COOLDOWN_MS = 30_000;
+const POOL_FISSION_ACCOUNT_EXISTS_STOP_THRESHOLD = 3;
 const K12_WORKSPACE_SWITCH_TOKEN_RETRIES = 6;
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
@@ -1677,6 +1679,14 @@ async function enqueueNextPoolFissionTask(email: EmailRecord, task: K12Task): Pr
     return undefined;
   }
   const parent = findPoolFissionParent(email);
+  const root = rootMailboxIdentity(parent);
+  if (task.status === "failed" && isOpenAiUserAlreadyExistsMessage(task.error) && shouldStopPoolFissionForAccountExists(root)) {
+    parent.smsBowerFissionChildrenRemaining = 0;
+    parent.updatedAt = nowIso();
+    appendLog(task, "warn", `同母邮箱 ${root} 已有多个子号返回 user_already_exists，停止继续补分裂，当前成功子号 ${successfulFissionChildrenForRoot(root)}`);
+    await Promise.all([persistTasks(), persistEmails()]);
+    return undefined;
+  }
   const child = createPoolFissionChild(parent);
   const nextRemaining = poolFissionRemainingForNextTask({status: task.status, remaining});
   const childTask = enqueueK12Task(child, {
@@ -2145,6 +2155,27 @@ function successfulFissionChildrenForRoot(root: string): number {
   return successful.size;
 }
 
+function accountExistsFissionFailuresForRoot(root: string): number {
+  const failed = new Set<string>();
+  for (const task of relatedK12TasksForRoot(root)) {
+    const email = emails.find((item) => item.id === task.emailId);
+    if (!email || !isFissionChildEmail(email, root)) continue;
+    const text = [
+      task.error || "",
+      email.lastError || "",
+      ...(task.logs || []).map((log) => log.message || ""),
+    ].join("\n");
+    if (!isOpenAiUserAlreadyExistsMessage(text)) continue;
+    failed.add(email.email.toLowerCase());
+  }
+  return failed.size;
+}
+
+function shouldStopPoolFissionForAccountExists(root: string): boolean {
+  return accountExistsFissionFailuresForRoot(root) >= POOL_FISSION_ACCOUNT_EXISTS_STOP_THRESHOLD
+    && successfulFissionChildrenForRoot(root) > 0;
+}
+
 function activeFissionTasksForRoot(root: string): number {
   return relatedK12TasksForRoot(root).filter((task) => task.status === "queued" || task.status === "running").length;
 }
@@ -2192,6 +2223,21 @@ async function createFissionTopUpTask(body: Record<string, unknown>): Promise<{
 
   const successfulChildren = successfulFissionChildrenForRoot(root);
   const activeTasks = activeFissionTasksForRoot(root);
+  if (!useSmsBowerTopUp && shouldStopPoolFissionForAccountExists(root)) {
+    if (relatedTasks[0]) {
+      appendLog(relatedTasks[0], "warn", `邮箱池母号 ${root} 多个子号已存在，按当前成功子号 ${successfulChildren} 个结束分裂`);
+    }
+    parent.smsBowerFissionChildrenRemaining = 0;
+    parent.updatedAt = nowIso();
+    return {
+      created: [],
+      rootEmail: root,
+      targetSuccesses: successfulChildren,
+      successfulChildren,
+      deficit: 0,
+      activeTasks,
+    };
+  }
   const targetSuccesses = fissionTargetForRoot(root, successfulChildren, body.targetSuccesses);
   const deficit = fissionTopUpDeficit({targetSuccesses, successfulChildren, activeTasks});
   if (deficit <= 0) {

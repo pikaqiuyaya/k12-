@@ -9,6 +9,7 @@ export interface TaskGroupInput {
   otpMode?: string;
   status: string;
   route: string;
+  error?: string;
   createdAt?: string;
   updatedAt?: string;
   startedAt?: string;
@@ -133,6 +134,24 @@ function hasSmsBowerCodeLimitStop<T extends TaskGroupInput>(items: T[]): boolean
   )));
 }
 
+function hasOpenAiUserAlreadyExists(item: TaskGroupInput): boolean {
+  const text = [
+    item.error || "",
+    ...(item.logs || []).map((log) => log.message || ""),
+  ].join("\n");
+  return /user_already_exists|An account already exists for this email address|please login instead/i.test(text);
+}
+
+function repeatedAccountExistsChildren<T extends TaskGroupInput>(items: T[]): number {
+  const out = new Set<string>();
+  for (const item of items) {
+    if (!isChildTask(item)) continue;
+    if (!hasOpenAiUserAlreadyExists(item)) continue;
+    out.add(lower(item.email) || item.id);
+  }
+  return out.size;
+}
+
 function fissionTarget<T extends TaskGroupInput>(items: T[], successfulChildren: number, attemptChildren: number, source: TaskGroupSource, minimumTargetChildren = 0): number {
   const counters = items
     .map((item) => item.smsBowerFissionRemainingAfterThis)
@@ -158,6 +177,7 @@ function fissionTarget<T extends TaskGroupInput>(items: T[], successfulChildren:
     }
     return Math.max(maxTaskCounter, successfulChildren, attemptChildren, configuredTarget);
   }
+  if (repeatedAccountExistsChildren(items) >= 3 && successfulChildren > 0) return successfulChildren;
   return Math.max(maxTaskCounter, maxCurrentTarget, successfulChildren, configuredTarget);
 }
 

@@ -47,6 +47,24 @@ test("marks an unfinished group with successful children as partial instead of f
   assert.equal(rows[0].fissionFailedChildren, 1);
 });
 
+test("stops an email-pool fission group after repeated user-already-exists child failures", () => {
+  const rows = buildTaskGroups([
+    task({id: "root", email: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 5}),
+    task({id: "c1", email: "mother+one@gmail.com", parentEmail: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 4}),
+    task({id: "c2", email: "mother+two@gmail.com", parentEmail: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 3}),
+    task({id: "c3", email: "mother+three@gmail.com", parentEmail: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 2}),
+    task({id: "c4", email: "mother+four@gmail.com", parentEmail: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 1}),
+    task({id: "f1", email: "mother+five@gmail.com", parentEmail: "mother@gmail.com", status: "failed", smsBowerFissionRemainingAfterThis: 0, error: "CreateAccount failed: user_already_exists"}),
+    task({id: "f2", email: "mother+six@gmail.com", parentEmail: "mother@gmail.com", status: "failed", smsBowerFissionRemainingAfterThis: 0, logs: [{message: "An account already exists for this email address"}]}),
+    task({id: "f3", email: "mother+seven@gmail.com", parentEmail: "mother@gmail.com", status: "failed", smsBowerFissionRemainingAfterThis: 0, error: "code=user_already_exists"}),
+  ], {minimumTargetChildren: 5});
+
+  assert.equal(rows[0].status, "success");
+  assert.equal(rows[0].fissionSuccessChildren, 4);
+  assert.equal(rows[0].fissionTargetChildren, 4);
+  assert.equal(canTopUpTaskGroupFission(rows[0]), false);
+});
+
 test("uses the current configured fission target for historical groups", () => {
   const rows = buildTaskGroups([
     task({id: "root", email: "mother@gmail.com", status: "success", smsBowerFissionRemainingAfterThis: 4}),

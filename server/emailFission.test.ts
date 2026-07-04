@@ -8,6 +8,7 @@ import {
   hasSmsBowerFissionHistory,
   isSmsBowerCodeLimitReachedMessage,
   isSmsBowerNoCodeTimeoutMessage,
+  isOpenAiUserAlreadyExistsMessage,
   isWrongEmailOtpCodeMessage,
   mailboxOtpWaitOptions,
   poolFissionRemainingForNextTask,
@@ -250,6 +251,12 @@ test("detects SMSBower per-activation code limit responses", () => {
 test("detects SMSBower no-code timeout responses for replacement", () => {
   assert.equal(isSmsBowerNoCodeTimeoutMessage("SMSBower 邮箱中未找到验证码: a@gmail.com; last=SMSBower getCode 失败: Code has not been received yet"), true);
   assert.equal(isSmsBowerNoCodeTimeoutMessage("K12 workspace HTTP 401"), false);
+});
+
+test("detects OpenAI user-already-exists responses for alias-family fission stop", () => {
+  assert.equal(isOpenAiUserAlreadyExistsMessage("CreateAccount 请求失败: HTTP 400 {\"error\":{\"code\":\"user_already_exists\"}}"), true);
+  assert.equal(isOpenAiUserAlreadyExistsMessage("An account already exists for this email address, please login instead."), true);
+  assert.equal(isOpenAiUserAlreadyExistsMessage("K12 workspace HTTP 401"), false);
 });
 
 test("continues SMSBower dynamic batch until target successes are reached", () => {

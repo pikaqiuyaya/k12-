@@ -138,6 +138,11 @@ export function isSmsBowerNoCodeTimeoutMessage(value: unknown): boolean {
   return /SMSBower 邮箱中未找到验证码|Code has not been received yet|code has not been received|no code|验证码.*未收到|未找到验证码/i.test(message);
 }
 
+export function isOpenAiUserAlreadyExistsMessage(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : String(value || "");
+  return /user_already_exists|An account already exists for this email address|please login instead/i.test(message);
+}
+
 export function shouldAutoReplaceSmsBowerMailFailure(input: SmsBowerAutoReplaceInput): boolean {
   if (input.otpMode !== "smsbower-mail") return false;
   if (!input.smsBowerMailId) return false;
