@@ -1816,17 +1816,17 @@ export class OpenAIClient {
             throw new Error(`打开注册页缺少跳转URL: ${JSON.stringify(payload)}`);
         }
 
-        const authorizeResp = await this.fetch(payload.url, {
-            method: "GET",
-            redirect: "follow",
-            headers: this.createBrowserHeaders({
+        const authorizeResp = await this.fetchAuthorizeDocumentWithRateLimitRetry(
+            payload.url,
+            "OpenAI authorize 页",
+            {
                 "accept-encoding": "gzip, deflate, br",
                 referer: `${CHATGPT_BASE_URL}/`,
                 "sec-fetch-dest": "document",
                 "sec-fetch-mode": "navigate",
                 "sec-fetch-site": "same-site",
-            }),
-        });
+            },
+        );
         if (!authorizeResp.ok) {
             throw new Error(`打开 OpenAI authorize 页失败: ${authorizeResp.status}`);
         }
@@ -1870,16 +1870,16 @@ export class OpenAIClient {
         authorizeUrl.searchParams.set("screen_hint", this.signupScreenHint);
         authorizeUrl.searchParams.set("login_hint", email);
 
-        const response = await this.fetch(authorizeUrl.toString(), {
-            method: "GET",
-            redirect: "follow",
-            headers: this.createBrowserHeaders({
+        const response = await this.fetchAuthorizeDocumentWithRateLimitRetry(
+            authorizeUrl.toString(),
+            "直接注册授权页",
+            {
                 "accept-encoding": "gzip, deflate, br",
                 "sec-fetch-dest": "document",
                 "sec-fetch-mode": "navigate",
                 "sec-fetch-site": "none",
-            }),
-        });
+            },
+        );
         if (!response.ok) {
             throw new Error(`打开直接注册授权页失败: ${response.status}`);
         }
@@ -1888,6 +1888,31 @@ export class OpenAIClient {
         if (!this.deviceID) {
             throw new Error("直接注册授权页未返回 oai-did cookie");
         }
+    }
+
+    private async fetchAuthorizeDocumentWithRateLimitRetry(
+        url: string,
+        label: string,
+        headers: Record<string, string>,
+    ): Promise<Response> {
+        const maxAttempts = AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS.length + 1;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const response = await this.fetch(url, {
+                method: "GET",
+                redirect: "follow",
+                headers: this.createBrowserHeaders(headers),
+            });
+            if (response.status === 429 && attempt < maxAttempts) {
+                const delayMs = AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS[attempt - 1]
+                    ?? AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS[AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS.length - 1];
+                console.log(`[authorize-page 429] ${this.email} ${label} 第 ${attempt} 次被限流，等待 ${delayMs}ms 后重试`);
+                await response.arrayBuffer().catch(() => undefined);
+                await sleep(delayMs);
+                continue;
+            }
+            return response;
+        }
+        throw new Error(`打开 ${label} 失败: exhausted retries`);
     }
 
     private createBrowserHeaders(init: Record<string, string>): Headers {

@@ -181,8 +181,17 @@ function detectDeadInJson(value: unknown): string {
     const record = value as Record<string, unknown>;
     const status = asString(record.status).toLowerCase();
     const message = asString(record.message) || asString(record.error) || asString(record.reason);
-    if (status === "dead" || /email_dead|mailbox dead|mail dead/i.test(message)) {
-        return message || "mailbox dead";
+    const apiMessage = message || asString(record.msg);
+    if (
+        record.successful === false
+        && /email account is invalid|invalid email|email_invalid|邮箱.*无效|邮箱.*不可用|email_dead|mailbox dead|mail dead/i.test(
+            `${apiMessage} ${asString(record.code)}`,
+        )
+    ) {
+        return apiMessage || "mailbox invalid";
+    }
+    if (status === "dead" || /email_dead|mailbox dead|mail dead/i.test(apiMessage)) {
+        return apiMessage || "mailbox dead";
     }
     for (const child of Object.values(record)) {
         const reason = detectDeadInJson(child);

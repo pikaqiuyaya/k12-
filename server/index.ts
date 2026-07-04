@@ -5,6 +5,54 @@ import {createServer, type IncomingMessage, type ServerResponse} from "node:http
 import path from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {fetch as undiciFetch, ProxyAgent} from "undici";
+import {validateSub2ApiPasswordPatch} from "./configPatch";
+import {
+  authWorkspaceSelectionCandidates,
+  isRecoverableWorkspaceSwitchAuthStep,
+  isRecoverableWorkspaceSelectError,
+  isSameDomainWorkspaceError,
+  mergeWorkspaceFallbackIds,
+  shouldRetryK12Invite,
+} from "./k12Workspace";
+import {
+  isGoogleSsoUnsupportedMessage,
+  isSmsBowerCodeLimitReachedMessage,
+  isSmsBowerActivationCanceledMessage,
+  isWrongEmailOtpCodeMessage,
+  fissionTopUpDeficit,
+  fissionTopUpBlockReason,
+  fissionTopUpRemainingAfterThis,
+  hasSmsBowerFissionHistory,
+  mailboxOtpWaitOptions,
+  poolFissionRemainingForNextTask,
+  poolFissionRemainingForNewTask,
+  shouldEnqueueSmsBowerBatchReplacement,
+  shouldAutoReplaceSmsBowerMailFailure,
+  shouldCreatePoolFissionChild,
+  shouldRequestSmsBowerNextCodeBeforeWait,
+  shouldSkipDuplicateQueuedTask,
+  smsBowerActivationBlockReason,
+  taskCreationSkipReason,
+} from "./emailFission";
+import {createSub2ApiAdminLoginManager} from "./sub2ApiAdminAuth";
+import {shouldFailTaskAfterServerRestart} from "./taskRestart";
+import {
+  K12_PLAN_MISMATCH_ISSUE,
+  SUB2API_K12_STATUS_ERROR_ISSUE,
+  isAutoAtRepairIssue,
+  shouldCreateAutoAtRepairTask,
+  sub2ApiAccountEmailCandidatesFromName,
+  sub2ApiK12StatusErrorReason,
+  type K12RepairIssue,
+} from "./sub2ApiAccountRepair";
+import {
+  combineDirectAndSub2Liveness,
+  k12PlanMismatchReason,
+  shouldTrySub2LivenessAfterDirectFailure,
+  type AccessTokenLivenessResult,
+} from "./accessTokenLiveness";
+import {isMissingChatGptAccessTokenError} from "./chatGptSession";
+import {poolFissionCooldownDelayMs} from "./poolFissionCooldown";
 
 type K12Route = "request" | "accept";
 type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
@@ -37,6 +85,7 @@ interface AppConfig {
   sub2apiAccountPriority: number;
   sub2apiConcurrency: number;
   sub2apiAutoRefillEnabled: boolean;
+  sub2apiAutoAtRepairEnabled: boolean;
   sub2apiRefillGroupName: string;
   sub2apiRefillThreshold: number;
   sub2apiRefillEmailCount: number;
@@ -159,7 +208,15 @@ interface K12Task {
   waitingOtpLabel?: string;
   waitingOtpEmail?: string;
   waitingOtpSince?: string;
+  freshEmailOtpOnlyOnce?: boolean;
   smsBowerFissionRemainingAfterThis?: number;
+  otpMode?: EmailOtpMode;
+  smsBowerMailRoot?: string;
+  smsBowerAutoReplaceOnFailure?: boolean;
+  smsBowerReplacementRemaining?: number;
+  smsBowerReplacementSourceTaskId?: string;
+  smsBowerBatchId?: string;
+  smsBowerBatchTargetSuccesses?: number;
   logs: TaskLog[];
 }
 
@@ -207,6 +264,21 @@ interface Sub2ApiRefillHistoryEntry extends Partial<Sub2ApiRefillResult> {
   error?: string;
 }
 
+interface Sub2ApiAutoAtRepairResult {
+  checkedAt: string;
+  source: "manual" | "timer";
+  groupName: string;
+  groupLabel: string;
+  scannedAccounts: number;
+  issueAccounts: number;
+  matchedEmails: number;
+  createdTasks: number;
+  skippedRunning: number;
+  skippedUnmatched: number;
+  message: string;
+  samples: string[];
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
@@ -238,6 +310,9 @@ const MANUAL_OTP_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_SMSBOWER_MAIL_BASE_URL = "https://smsbower.page/api/mail";
 const DEFAULT_SMSBOWER_HANDLER_URL = "https://smsbower.page/stubs/handler_api.php";
 const DEFAULT_EMAILNATOR_BASE_URL = "https://www.emailnator.com";
+const DEFAULT_SMSBOWER_AUTO_REPLACEMENT_LIMIT = 1;
+const SMSBOWER_CODE_MAX_ATTEMPTS = 30;
+const POOL_FISSION_CHILD_COOLDOWN_MS = 30_000;
 const K12_WORKSPACE_SWITCH_TOKEN_RETRIES = 6;
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
@@ -255,6 +330,10 @@ let sub2apiRefillLastCheckedAt = "";
 let sub2apiRefillNextCheckAt = "";
 let sub2apiRefillLastError = "";
 let sub2apiRefillLastResult: Sub2ApiRefillResult | null = null;
+let sub2apiAutoAtRepairRunning = false;
+let sub2apiAutoAtRepairLastCheckedAt = "";
+let sub2apiAutoAtRepairLastError = "";
+let sub2apiAutoAtRepairLastResult: Sub2ApiAutoAtRepairResult | null = null;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -473,6 +552,7 @@ async function defaultConfig(): Promise<AppConfig> {
     sub2apiAccountPriority: asNumber(ref.sub2apiAccountPriority, 1, 1),
     sub2apiConcurrency: asNumber(ref.sub2apiConcurrency, 10, 1),
     sub2apiAutoRefillEnabled: false,
+    sub2apiAutoAtRepairEnabled: false,
     sub2apiRefillGroupName: "k12",
     sub2apiRefillThreshold: 5,
     sub2apiRefillEmailCount: 5,
@@ -499,7 +579,13 @@ async function defaultConfig(): Promise<AppConfig> {
 async function loadConfig(): Promise<AppConfig> {
   const base = await defaultConfig();
   const saved = await readJson<Partial<AppConfig>>(configFile, {});
-  return normalizeConfig({...base, ...saved});
+  return normalizeConfig({
+    ...base,
+    ...saved,
+    sub2apiAutoAtRepairEnabled: "sub2apiAutoAtRepairEnabled" in saved
+      ? saved.sub2apiAutoAtRepairEnabled
+      : saved.sub2apiAutoRefillEnabled,
+  });
 }
 
 function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
@@ -530,6 +616,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     sub2apiAccountPriority: asNumber(raw.sub2apiAccountPriority, 1, 1),
     sub2apiConcurrency: asNumber(raw.sub2apiConcurrency, 10, 1),
     sub2apiAutoRefillEnabled: asBoolean(raw.sub2apiAutoRefillEnabled, false),
+    sub2apiAutoAtRepairEnabled: asBoolean(raw.sub2apiAutoAtRepairEnabled, false),
     sub2apiRefillGroupName: asString(raw.sub2apiRefillGroupName, raw.sub2apiGroupName || "k12") || "k12",
     sub2apiRefillThreshold: asNumber(raw.sub2apiRefillThreshold, 5, 0, 100000),
     sub2apiRefillEmailCount: asNumber(raw.sub2apiRefillEmailCount, 5, 1, 500),
@@ -578,6 +665,7 @@ async function ensureCompatBundleConfig(): Promise<void> {
     sub2apiAccountPriority: appConfig.sub2apiAccountPriority,
     sub2apiConcurrency: appConfig.sub2apiConcurrency,
     sub2apiAutoRefillEnabled: appConfig.sub2apiAutoRefillEnabled,
+    sub2apiAutoAtRepairEnabled: appConfig.sub2apiAutoAtRepairEnabled,
     sub2apiRefillGroupName: appConfig.sub2apiRefillGroupName,
     sub2apiRefillThreshold: appConfig.sub2apiRefillThreshold,
     sub2apiRefillEmailCount: appConfig.sub2apiRefillEmailCount,
@@ -1389,6 +1477,8 @@ function createSmsBowerFissionChild(parent: EmailRecord): EmailRecord {
 async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label: string): Promise<string> {
   const id = asString(email.smsBowerMailId);
   if (!id) throw new Error(`SMSBower 邮箱缺少 activation id: ${email.email}`);
+  const blockedReason = smsBowerActivationBlockReason(email);
+  if (blockedReason) throw new Error(blockedReason);
   const waitStartedAt = Date.now();
   task.waitingOtp = true;
   task.waitingOtpLabel = label;
@@ -1398,7 +1488,7 @@ async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label:
   await persistTasks();
   let last = "";
   try {
-    for (let attempt = 1; attempt <= 60; attempt += 1) {
+    for (let attempt = 1; attempt <= SMSBOWER_CODE_MAX_ATTEMPTS; attempt += 1) {
       assertNotCanceled(task);
       let payload: unknown;
       try {
@@ -1409,7 +1499,7 @@ async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label:
         if (isSmsBowerCodePendingMessage(message)) {
           last = message;
           if (attempt === 1 || attempt % 10 === 0) {
-            appendLog(task, "info", `SMSBower ${label} 验证码暂未收到，继续等待 (${attempt}/60)`);
+            appendLog(task, "info", `SMSBower ${label} 验证码暂未收到，继续等待 (${attempt}/${SMSBOWER_CODE_MAX_ATTEMPTS})`);
           }
           await sleepForTask(task, 3000);
           continue;
@@ -1453,10 +1543,41 @@ function isSmsBowerCodePendingMessage(message: string): boolean {
   return /code has not been received|try again later|no code|code not received|not received yet|验证码.*未|暂未收到/i.test(message);
 }
 
+function isSmsBowerBadActualActivationStatus(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /bad actual activation status/i.test(message);
+}
+
+async function markSmsBowerMailClosedLocally(email: EmailRecord, status: number, reason: string): Promise<void> {
+  const id = asString(email.smsBowerMailId);
+  if (!id) return;
+  const related = emails.filter((item) => item.smsBowerMailId === id);
+  for (const item of related) {
+    item.status = item.status === "success" ? item.status : "failed";
+    item.lastError = reason;
+    item.smsBowerMailClosedAt = item.smsBowerMailClosedAt || nowIso();
+    item.smsBowerMailCloseStatus = item.smsBowerMailCloseStatus ?? status;
+    item.updatedAt = nowIso();
+  }
+  await persistEmails();
+}
+
+function smsBowerClosedByRemoteStatusReason(email: EmailRecord): string {
+  return `SMSBower activation=${email.smsBowerMailId || "-"} 后台状态已结束，不能再获取验证码，请重新租 Gmail`;
+}
+
 async function setSmsBowerMailStatus(email: EmailRecord, status: number): Promise<void> {
   const id = asString(email.smsBowerMailId);
   if (!id || email.smsBowerMailClosedAt) return;
-  await requestSmsBowerMail("setStatus", {id, mailId: id, status});
+  try {
+    await requestSmsBowerMail("setStatus", {id, mailId: id, status});
+  } catch (error) {
+    if (isSmsBowerBadActualActivationStatus(error)) {
+      await markSmsBowerMailClosedLocally(email, status, smsBowerClosedByRemoteStatusReason(email));
+      return;
+    }
+    throw error;
+  }
   email.smsBowerMailClosedAt = nowIso();
   email.smsBowerMailCloseStatus = status;
   email.updatedAt = nowIso();
@@ -1465,7 +1586,16 @@ async function setSmsBowerMailStatus(email: EmailRecord, status: number): Promis
 async function requestSmsBowerNextMailCode(email: EmailRecord, task?: K12Task, reason = "请求等待下一个验证码"): Promise<void> {
   const id = asString(email.smsBowerMailId);
   if (!id || email.smsBowerMailClosedAt) return;
-  await requestSmsBowerMail("setStatus", {id, mailId: id, status: 5});
+  try {
+    await requestSmsBowerMail("setStatus", {id, mailId: id, status: 5});
+  } catch (error) {
+    if (isSmsBowerBadActualActivationStatus(error)) {
+      const closedReason = smsBowerClosedByRemoteStatusReason(email);
+      await markSmsBowerMailClosedLocally(email, 2, closedReason);
+      throw new Error(closedReason);
+    }
+    throw error;
+  }
   email.updatedAt = nowIso();
   if (task) appendLog(task, "info", `SMSBower ${reason}: activation=${id}`);
 }
@@ -1485,6 +1615,14 @@ async function finalizeSmsBowerMailIfDone(email: EmailRecord): Promise<void> {
   await persistEmails();
 }
 
+function findSmsBowerFissionRoot(email: EmailRecord): EmailRecord {
+  if (!email.smsBowerMailId) return email;
+  return emails.find((item) => (
+    item.smsBowerMailId === email.smsBowerMailId
+    && !item.parentEmail
+  )) || email;
+}
+
 async function enqueueNextSmsBowerFissionTask(parent: EmailRecord, task: K12Task): Promise<K12Task | undefined> {
   if (
     parent.otpMode !== "smsbower-mail"
@@ -1494,9 +1632,19 @@ async function enqueueNextSmsBowerFissionTask(parent: EmailRecord, task: K12Task
   ) {
     return undefined;
   }
+  const root = findSmsBowerFissionRoot(parent);
   const remaining = Math.max(0, task.smsBowerFissionRemainingAfterThis || 0);
-  await requestSmsBowerNextMailCode(parent, task, "母邮箱成功，已请求等待下一个验证码");
-  const child = createSmsBowerFissionChild(parent);
+  try {
+    await requestSmsBowerNextMailCode(root, task, "母邮箱成功，已请求等待下一个验证码");
+  } catch (error) {
+    if (!isSmsBowerCodeLimitReachedMessage(error)) throw error;
+    root.smsBowerFissionChildrenRemaining = 0;
+    root.updatedAt = nowIso();
+    appendLog(task, "warn", `SMSBower activation=${root.smsBowerMailId || "-"} 验证码次数已达上限，停止该母邮箱继续分裂`);
+    await Promise.all([persistTasks(), persistEmails()]);
+    return undefined;
+  }
+  const child = createSmsBowerFissionChild(root);
   const childTask = enqueueK12Task(child, {
     route: task.route,
     workspaceIds: task.workspaceIds,
@@ -1506,11 +1654,43 @@ async function enqueueNextSmsBowerFissionTask(parent: EmailRecord, task: K12Task
     sub2apiGroupName: task.sub2apiGroupName,
     fissionRemainingAfterThis: remaining - 1,
   });
-  parent.smsBowerFissionChildrenRemaining = remaining - 1;
-  parent.smsBowerFissionChildrenCreatedAt = nowIso();
-  parent.updatedAt = nowIso();
+  root.smsBowerFissionChildrenRemaining = remaining - 1;
+  root.smsBowerFissionChildrenCreatedAt = nowIso();
+  root.updatedAt = nowIso();
   appendLog(task, "ok", `母邮箱成功，已创建裂变子任务: ${child.email}，剩余 ${remaining - 1}`);
   appendLog(childTask, "info", `由母邮箱 ${parent.email} 成功后创建，复用 SMSBower activation=${parent.smsBowerMailId}`);
+  await Promise.all([persistTasks(), persistEmails()]);
+  return childTask;
+}
+
+async function enqueueNextPoolFissionTask(email: EmailRecord, task: K12Task): Promise<K12Task | undefined> {
+  const hasFissionCounter = task.smsBowerFissionRemainingAfterThis !== undefined;
+  const remaining = Math.max(0, task.smsBowerFissionRemainingAfterThis || 0);
+  if (!shouldCreatePoolFissionChild({
+    enabled: appConfig.smsBowerGmailFissionEnabled,
+    status: task.status,
+    isSmsBowerMail: email.otpMode === "smsbower-mail",
+    hasFissionCounter,
+    isChildEmail: Boolean(email.parentEmail),
+    remaining,
+  })) {
+    return undefined;
+  }
+  const parent = findPoolFissionParent(email);
+  const child = createPoolFissionChild(parent);
+  const nextRemaining = poolFissionRemainingForNextTask({status: task.status, remaining});
+  const childTask = enqueueK12Task(child, {
+    route: task.route,
+    workspaceIds: task.workspaceIds,
+    runWorkspaceJoin: task.runWorkspaceJoin,
+    runSub2Api: task.runSub2Api,
+    sub2apiNoRtMode: task.sub2apiNoRtMode === true,
+    sub2apiGroupName: task.sub2apiGroupName,
+    fissionRemainingAfterThis: nextRemaining,
+  });
+  const reason = task.status === "success" ? "成功后" : "失败后补位";
+  appendLog(task, task.status === "success" ? "ok" : "warn", `邮箱池${email.parentEmail ? "子邮箱" : "母邮箱"}${reason}，已创建裂变子任务: ${child.email}，剩余 ${nextRemaining}`);
+  appendLog(childTask, "info", `由邮箱 ${email.email} ${reason}创建，母邮箱 ${parent.email}，复用邮箱池接码配置`);
   await Promise.all([persistTasks(), persistEmails()]);
   return childTask;
 }
@@ -1908,6 +2088,10 @@ function hasActiveTask(emailId: string): boolean {
   return tasks.some((task) => task.emailId === emailId && (task.status === "queued" || task.status === "running"));
 }
 
+function hasPriorSuccessfulK12Task(emailId: string, exceptTaskId: string): boolean {
+  return tasks.some((task) => task.id !== exceptTaskId && task.emailId === emailId && task.kind === "k12" && task.status === "success");
+}
+
 function removeEmails(ids: string[]): {removed: number; skippedRunning: number; missing: number} {
   const requested = new Set(ids.filter(Boolean));
   if (!requested.size) return {removed: 0, skippedRunning: 0, missing: 0};
@@ -1942,6 +2126,122 @@ function rootMailboxIdentityByEmailId(emailId: string): string {
   return email ? rootMailboxIdentity(email) : emailId;
 }
 
+function relatedK12TasksForRoot(root: string): K12Task[] {
+  return tasks.filter((task) => (task.kind || "k12") === "k12" && rootMailboxIdentityByEmailId(task.emailId) === root);
+}
+
+function isFissionChildEmail(email: EmailRecord, root: string): boolean {
+  return rootMailboxIdentity(email) === root && (Boolean(email.parentEmail) || (Boolean(email.smsBowerMailRoot) && email.email.toLowerCase() !== root));
+}
+
+function successfulFissionChildrenForRoot(root: string): number {
+  const successful = new Set<string>();
+  for (const task of relatedK12TasksForRoot(root)) {
+    if (task.status !== "success") continue;
+    const email = emails.find((item) => item.id === task.emailId);
+    if (!email || !isFissionChildEmail(email, root)) continue;
+    successful.add(email.email.toLowerCase());
+  }
+  return successful.size;
+}
+
+function activeFissionTasksForRoot(root: string): number {
+  return relatedK12TasksForRoot(root).filter((task) => task.status === "queued" || task.status === "running").length;
+}
+
+function fissionTargetForRoot(root: string, successfulChildren: number, requestedTarget?: unknown): number {
+  const requested = requestedTarget === undefined ? 0 : asNumber(requestedTarget, 0, 0, 100);
+  const taskCounterTarget = relatedK12TasksForRoot(root)
+    .map((task) => task.smsBowerFissionRemainingAfterThis)
+    .filter((value): value is number => Number.isFinite(value))
+    .reduce((max, value) => Math.max(max, value), 0);
+  const rootEmail = emails.find((email) => email.email.toLowerCase() === root && !email.parentEmail);
+  const remainingTarget = rootEmail?.smsBowerFissionChildrenRemaining === undefined
+    ? 0
+    : rootEmail.smsBowerFissionChildrenRemaining + successfulChildren;
+  return Math.max(requested, taskCounterTarget, remainingTarget, successfulChildren);
+}
+
+function latestFissionTemplateTask(root: string): K12Task | undefined {
+  const related = relatedK12TasksForRoot(root);
+  return [...related].sort((a, b) => {
+    const aTime = Date.parse(a.finishedAt || a.updatedAt || a.createdAt);
+    const bTime = Date.parse(b.finishedAt || b.updatedAt || b.createdAt);
+    return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+  })[0];
+}
+
+async function createFissionTopUpTask(body: Record<string, unknown>): Promise<{
+  created: K12Task[];
+  rootEmail: string;
+  targetSuccesses: number;
+  successfulChildren: number;
+  deficit: number;
+  activeTasks: number;
+}> {
+  const root = asString(body.rootEmail).toLowerCase();
+  if (!root) throw new Error("缺少母号邮箱");
+  const parent = emails.find((email) => email.email.toLowerCase() === root && !email.parentEmail);
+  if (!parent) throw new Error(`找不到母号邮箱: ${root}`);
+  if (parent.status === "banned") throw new Error(`母号已标记 GPT 封号，不能继续补分裂: ${root}`);
+  const relatedTasks = relatedK12TasksForRoot(root);
+  const hasSmsBowerHistory = hasSmsBowerFissionHistory({tasks: relatedTasks, emails});
+  const blockReason = fissionTopUpBlockReason({otpMode: parent.otpMode, hasSmsBowerHistory});
+  if (blockReason) throw new Error(blockReason);
+
+  const successfulChildren = successfulFissionChildrenForRoot(root);
+  const activeTasks = activeFissionTasksForRoot(root);
+  const targetSuccesses = fissionTargetForRoot(root, successfulChildren, body.targetSuccesses);
+  const deficit = fissionTopUpDeficit({targetSuccesses, successfulChildren, activeTasks});
+  if (deficit <= 0) {
+    return {created: [], rootEmail: root, targetSuccesses, successfulChildren, deficit, activeTasks};
+  }
+
+  const template = latestFissionTemplateTask(root);
+  if (!template) throw new Error(`找不到可复用的母号任务配置: ${root}`);
+
+  const child = createPoolFissionChild(parent);
+
+  const childTask = enqueueK12Task(child, {
+    route: template.route,
+    workspaceIds: template.workspaceIds,
+    runWorkspaceJoin: template.runWorkspaceJoin,
+    runSub2Api: template.runSub2Api,
+    sub2apiNoRtMode: template.sub2apiNoRtMode === true,
+    sub2apiGroupName: template.sub2apiGroupName,
+    fissionRemainingAfterThis: fissionTopUpRemainingAfterThis(deficit),
+  });
+  appendLog(template, "info", `继续补分裂: ${root} 当前 ${successfulChildren}/${targetSuccesses}，已创建补位子任务 ${child.email}，缺口 ${deficit}`);
+  appendLog(childTask, "info", `继续补分裂创建，母邮箱 ${root}，目标 ${targetSuccesses}，当前成功子号 ${successfulChildren}`);
+  return {created: [childTask], rootEmail: root, targetSuccesses, successfulChildren, deficit, activeTasks};
+}
+
+function latestFinishedTaskAtMsForRoot(root: string, exceptTaskId: string): number | undefined {
+  let latest = 0;
+  for (const task of tasks) {
+    if (task.id === exceptTaskId) continue;
+    if (!task.finishedAt) continue;
+    if (rootMailboxIdentityByEmailId(task.emailId) !== root) continue;
+    const finishedAt = Date.parse(task.finishedAt);
+    if (Number.isFinite(finishedAt) && finishedAt > latest) latest = finishedAt;
+  }
+  return latest || undefined;
+}
+
+async function waitForPoolFissionChildCooldown(task: K12Task, email: EmailRecord): Promise<void> {
+  const root = rootMailboxIdentity(email);
+  const delayMs = poolFissionCooldownDelayMs({
+    isChildEmail: Boolean(email.parentEmail),
+    isSmsBowerMail: email.otpMode === "smsbower-mail",
+    nowMs: Date.now(),
+    cooldownMs: POOL_FISSION_CHILD_COOLDOWN_MS,
+    lastFinishedAtMs: latestFinishedTaskAtMsForRoot(root, task.id),
+  });
+  if (delayMs <= 0) return;
+  appendLog(task, "info", `同母邮箱分裂冷却 ${Math.ceil(delayMs / 1000)} 秒，避免验证码投递过密`);
+  await sleepForTask(task, delayMs);
+}
+
 function randomAliasSuffix(length = 6): string {
   const alphabet = "abcdefghijklmnopqrstuvwxyz";
   let out = "";
@@ -1958,9 +2258,44 @@ function buildPlusAlias(email: string, suffix: string): string {
   return `${baseLocal}+${suffix}@${domain}`;
 }
 
+function findPoolFissionParent(email: EmailRecord): EmailRecord {
+  const parentEmail = rootMailboxIdentity(email);
+  return emails.find((item) => item.email.toLowerCase() === parentEmail && !item.parentEmail) || email;
+}
+
+function createPoolFissionChild(parent: EmailRecord): EmailRecord {
+  const parentEmail = rootMailboxIdentity(parent);
+  const byEmail = new Set(emails.map((item) => item.email.toLowerCase()));
+  let alias = "";
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    alias = buildPlusAlias(parentEmail, randomAliasSuffix(6));
+    if (!byEmail.has(alias.toLowerCase())) break;
+    alias = "";
+  }
+  if (!alias) throw new Error(`邮箱池裂变失败：无法生成唯一子邮箱 ${parentEmail}`);
+  const record: EmailRecord = {
+    id: stableId(alias),
+    email: alias,
+    parentEmail,
+    otpMode: parent.otpMode || "auto",
+    password: parent.password,
+    mailboxUrl: parent.mailboxUrl,
+    clientId: parent.clientId,
+    refreshToken: parent.refreshToken,
+    raw: `${alias}----alias-of----${parentEmail}`,
+    status: "free",
+    importedAt: nowIso(),
+    updatedAt: nowIso(),
+    smsBowerMailId: parent.smsBowerMailId,
+    smsBowerMailRoot: parent.smsBowerMailRoot || parentEmail,
+    smsBowerMailCost: parent.smsBowerMailCost,
+  };
+  emails.push(record);
+  return record;
+}
+
 function splitEmails(ids: string[], perParent: number): {created: number; skipped: number; items: Array<{parentEmail: string; email: string}>} {
   const requested = new Set(ids.filter(Boolean));
-  const byEmail = new Set(emails.map((item) => item.email.toLowerCase()));
   const processedParents = new Set<string>();
   const createdItems: Array<{parentEmail: string; email: string}> = [];
   let skipped = 0;
@@ -1972,38 +2307,25 @@ function splitEmails(ids: string[], perParent: number): {created: number; skippe
       continue;
     }
     processedParents.add(parentEmail);
+    const smsBowerBlockedReason = smsBowerActivationBlockReason(parent);
+    if (smsBowerBlockedReason) {
+      parent.status = "failed";
+      parent.lastError = smsBowerBlockedReason;
+      parent.updatedAt = nowIso();
+      skipped += 1;
+      continue;
+    }
     if (parent.status === "running" || hasActiveTask(parent.id)) {
       skipped += 1;
       continue;
     }
     for (let i = 0; i < perParent; i += 1) {
-      let alias = "";
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        alias = buildPlusAlias(parentEmail, randomAliasSuffix(6));
-        if (!byEmail.has(alias.toLowerCase())) break;
-        alias = "";
-      }
-      if (!alias) {
+      try {
+        const record = createPoolFissionChild(parent);
+        createdItems.push({parentEmail, email: record.email});
+      } catch {
         skipped += 1;
-        continue;
       }
-      const record: EmailRecord = {
-        id: stableId(alias),
-        email: alias,
-        parentEmail,
-        otpMode: parent.otpMode || "auto",
-        password: parent.password,
-        mailboxUrl: parent.mailboxUrl,
-        clientId: parent.clientId,
-        refreshToken: parent.refreshToken,
-        raw: `${alias}----alias-of----${parentEmail}`,
-        status: "free",
-        importedAt: nowIso(),
-        updatedAt: nowIso(),
-      };
-      emails.push(record);
-      byEmail.add(alias.toLowerCase());
-      createdItems.push({parentEmail, email: alias});
     }
   }
 
@@ -2061,7 +2383,7 @@ function isInvalidAuthStateError(error: unknown): boolean {
     : typeof error === "object" && error && "message" in error
       ? String((error as {message?: unknown}).message || "")
       : String(error);
-  return /invalid_state|invalid_auth_step|Invalid authorization step|sign-in session is no longer valid/i.test(message);
+  return isRecoverableWorkspaceSelectError(message) || /Invalid authorization step/i.test(message);
 }
 
 function isOpenAiAccountBannedMessage(value: unknown): boolean {
@@ -2096,10 +2418,17 @@ function authStepFromError(error: unknown): string {
 function normalizeFlowError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (isOpenAiAccountBannedMessage(message)) return "GPT 账号已被 OpenAI 停用/封禁";
+  if (isGoogleSsoUnsupportedMessage(message)) {
+    return googleSsoUnsupportedReason();
+  }
   if (isAddPhoneFlowError(error)) {
     return "登录后触发 add-phone 手机接码页面，按 K12 规则判定失败";
   }
   return message;
+}
+
+function googleSsoUnsupportedReason(): string {
+  return "OpenAI 识别为 Google 登录账号，当前自动流程不支持 Google OAuth，请换非 Google SSO 的 Gmail";
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -2117,7 +2446,8 @@ async function sleepForTask(task: K12Task, ms: number): Promise<void> {
 
 async function sendK12Invite(task: K12Task, client: any, accessToken: string, workspaceId: string, route: K12Route): Promise<K12WorkspaceResult> {
   let last: K12WorkspaceResult | null = null;
-  for (let attempt = 1; attempt <= appConfig.joinMaxRetries + 1; attempt += 1) {
+  const maxAttempts = appConfig.joinMaxRetries + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     assertNotCanceled(task);
     const url = `https://chatgpt.com/backend-api/accounts/${encodeURIComponent(workspaceId)}/invites/${route}`;
     appendLog(task, "info", `K12 ${route}: POST ${workspaceId.slice(0, 8)}... 第 ${attempt} 次`);
@@ -2150,11 +2480,17 @@ async function sendK12Invite(task: K12Task, client: any, accessToken: string, wo
         return last;
       }
       appendLog(task, "warn", `K12 ${workspaceId.slice(0, 8)}... HTTP ${response.status}: ${body.slice(0, 180)}`);
+      if (isSameDomainWorkspaceError(response.status, body)) {
+        appendLog(task, "warn", `K12 ${workspaceId.slice(0, 8)}... 拒绝跨域邮箱申请，跳过该 workspace 后续重试`);
+        break;
+      }
     } catch (error) {
       last = {workspaceId, route, ok: false, status: 0, body: error instanceof Error ? error.message : String(error), attempt};
       appendLog(task, "warn", `K12 ${workspaceId.slice(0, 8)}... 网络错误: ${last.body}`);
     }
-    if (attempt <= appConfig.joinMaxRetries) await sleep(appConfig.joinIntervalMs * attempt);
+    if (shouldRetryK12Invite(attempt, maxAttempts, last?.status ?? 0, last?.body ?? "")) {
+      await sleep(appConfig.joinIntervalMs * attempt);
+    }
   }
   return last || {workspaceId, route, ok: false, status: 0, body: "未执行", attempt: 0};
 }
@@ -2353,7 +2689,14 @@ async function completeAboutYou(client: any, task?: K12Task): Promise<string> {
 
 async function selectAuthWorkspace(client: any, task?: K12Task, referer = AUTH_WORKSPACE_URL): Promise<string> {
   const workspaceIds = task ? targetK12WorkspaceIds(task) : appConfig.workspaceIds;
-  const candidates = Array.from(new Set([...workspaceIds, "default", "personal"].filter(Boolean)));
+  const authSessions = await getAuthSessionCandidates(client);
+  let candidates = authWorkspaceSelectionCandidates(authSessions, workspaceIds);
+  if (!candidates.length) {
+    candidates = Array.from(new Set(workspaceIds.filter(Boolean)));
+  }
+  if (task && candidates.length) {
+    appendLog(task, "info", `auth workspace 可选: ${candidates.map((item) => item.slice(0, 8)).join(", ")}`);
+  }
   let lastError = "";
 
   for (const workspaceId of candidates) {
@@ -2411,6 +2754,25 @@ async function finishChatGptCallback(client: any, callbackUrl: string, task?: K1
   }
 }
 
+async function emailOtpValidateWithRetry(client: any, task?: K12Task): Promise<string> {
+  try {
+    return await client.emailOtpValidate();
+  } catch (error) {
+    if (!task || !isWrongEmailOtpCodeMessage(error)) throw error;
+    const email = emails.find((item) => item.id === task.emailId);
+    if (!email) throw error;
+    if (email.otpMode === "smsbower-mail") {
+      appendLog(task, "warn", "OpenAI 判定邮箱验证码错误，SMSBower 请求下一封验证码后重试一次");
+      await requestSmsBowerNextMailCode(email, task, "邮箱验证码错误后请求下一封");
+      const code = await waitForSmsBowerMailCode(email, task, "登录重试");
+      return client.emailOtpValidate(code);
+    }
+    task.freshEmailOtpOnlyOnce = true;
+    appendLog(task, "warn", "OpenAI 判定邮箱验证码错误，重新等待下一封新验证码后重试一次");
+    return client.emailOtpValidate();
+  }
+}
+
 async function continueAuthSteps(
   client: any,
   startUrl: string,
@@ -2457,7 +2819,7 @@ async function continueAuthSteps(
 
     if (continueUrl === `${AUTH_BASE_URL}/email-verification`) {
       log("info", "等待邮箱验证码并提交");
-      continueUrl = await client.emailOtpValidate();
+      continueUrl = await emailOtpValidateWithRetry(client, task);
       continue;
     }
 
@@ -2551,32 +2913,47 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
           appendLog(task, "warn", "重试后 auth session 仍失效，重新打开 ChatGPT auth 入口后接管流程");
           const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
           await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
+          return readChatGptAccessTokenWithRetry(client, task);
         }
         if (isEmailOtpSendStepError(retryError)) {
           appendLog(task, "warn", "重试后进入邮箱验证码流程，开始邮件接码");
           await continueAuthSteps(client, authStepFromError(retryError) || AUTH_EMAIL_OTP_SEND_URL, task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
+          return readChatGptAccessTokenWithRetry(client, task);
         }
         if (String(retryError instanceof Error ? retryError.message : retryError).includes(AUTH_WORKSPACE_URL)) {
           appendLog(task, "warn", "重试后停在 workspace 选择页，自动选择 K12 空间");
           await continueAuthSteps(client, AUTH_WORKSPACE_URL, task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
+          return readChatGptAccessTokenWithRetry(client, task);
         }
         if (authStepFromError(retryError)) {
           appendLog(task, "warn", `重试后接管 OpenAI auth step: ${authStepFromError(retryError)}`);
           await continueAuthSteps(client, authStepFromError(retryError), task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
+          return readChatGptAccessTokenWithRetry(client, task);
         }
         if (!isInvalidPasswordError(retryError)) throw retryError;
         appendLog(task, "warn", "重试后仍进入密码验证失败；按配置改走邮箱验证码登录");
         await continueAuthSteps(client, `${AUTH_BASE_URL}/log-in/password`, task, {finishChatGptCallback: true});
-        return String(await client.getChatGPTAccessToken());
+        return readChatGptAccessTokenWithRetry(client, task);
       }
     }
   }
   appendLog(task, "info", "读取 https://chatgpt.com/api/auth/session accessToken");
-  return String(await client.getChatGPTAccessToken());
+  return readChatGptAccessTokenWithRetry(client, task);
+}
+
+async function readChatGptAccessTokenWithRetry(client: any, task: K12Task, attempts = 6): Promise<string> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return String(await client.getChatGPTAccessToken());
+    } catch (error) {
+      lastError = error;
+      if (!isMissingChatGptAccessTokenError(error) || attempt >= attempts) break;
+      appendLog(task, "warn", `ChatGPT session 暂无 accessToken，等待后重读 (${attempt}/${attempts})`);
+      await sleepForTask(task, 1500 * attempt);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function extractAccessTokenFromCredentials(credentials: Record<string, unknown>): string {
@@ -2626,6 +3003,10 @@ function targetK12WorkspaceIds(task: K12Task): string[] {
     .filter(Boolean)));
 }
 
+function targetNoRtFallbackWorkspaceIds(task: K12Task): string[] {
+  return mergeWorkspaceFallbackIds(targetK12WorkspaceIds(task), appConfig.workspaceIds);
+}
+
 function isK12AccessToken(accessToken: string, task: K12Task): boolean {
   const tokenInfo = summarizeToken(accessToken);
   const plan = tokenInfo.planType.toLowerCase();
@@ -2649,7 +3030,7 @@ function safeUrlForLog(value: string): string {
 
 async function readChatGptSessionAccessToken(client: any, task: K12Task, reason: string): Promise<string> {
   appendLog(task, "info", `重新读取 ChatGPT Web AT: ${reason}`);
-  const token = String(await client.getChatGPTAccessToken());
+  const token = await readChatGptAccessTokenWithRetry(client, task);
   appendLog(task, "info", `当前 Web AT 上下文: ${describeAccessTokenContext(token)}`);
   return token;
 }
@@ -2877,10 +3258,15 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
     if (isAddPhoneUrl(currentUrl)) {
       throw new Error("切换 K12 workspace 时触发 add-phone，无法仅靠当前 Web session 完成");
     }
+    if (isRecoverableWorkspaceSwitchAuthStep(currentUrl)) {
+      appendLog(task, "info", `切换 K12 workspace 时接管 auth step: ${safeUrlForLog(currentUrl)}`);
+      currentUrl = await continueAuthSteps(client, currentUrl, task, {finishChatGptCallback: true, allowConsent: true});
+      if (currentUrl.startsWith(`${CHATGPT_BASE_URL}/api/auth/callback/openai`)) return;
+      continue;
+    }
     if (
       currentUrl === `${AUTH_BASE_URL}/log-in`
       || currentUrl.startsWith(`${AUTH_BASE_URL}/log-in`)
-      || currentUrl === `${AUTH_BASE_URL}/email-verification`
       || currentUrl === AUTH_CREATE_ACCOUNT_PASSWORD_URL
     ) {
       throw new Error(`切换 K12 workspace 需要重新登录，当前停在 ${safeUrlForLog(currentUrl)}`);
@@ -2959,7 +3345,7 @@ async function ensureK12AccessTokenForNoRt(client: any, task: K12Task, accessTok
 
   appendLog(task, "warn", `当前 AT 不是 K12 上下文，不能直接 noRT 入库: ${describeAccessTokenContext(accessToken)}`);
   let latestToken = accessToken;
-  for (const workspaceId of targetK12WorkspaceIds(task)) {
+  for (const workspaceId of targetNoRtFallbackWorkspaceIds(task)) {
     const existingOk = task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route && item.ok);
     if (!existingOk) {
       const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
@@ -3317,6 +3703,69 @@ function sub2ApiAccountCredentials(account: Record<string, unknown>): Record<str
   return (unwrapped.credentials && typeof unwrapped.credentials === "object" ? unwrapped.credentials : {}) as Record<string, unknown>;
 }
 
+function sub2ApiAccountK12PlanMismatch(account: Record<string, unknown>, accessToken: string, workspaceIds: string[]): string | undefined {
+  const credentials = sub2ApiAccountCredentials(account);
+  const tokenInfo = accessToken ? summarizeToken(accessToken) : null;
+  return k12PlanMismatchReason({
+    planType: asString(
+      credentials.plan_type
+      || credentials.planType
+      || credentials.chatgpt_plan_type
+      || tokenInfo?.planType,
+    ),
+    accountId: asString(
+      credentials.chatgpt_account_id
+      || credentials.chatgptAccountId
+      || credentials.account_id
+      || tokenInfo?.accountId,
+    ),
+    workspaceIds,
+  });
+}
+
+function sub2ApiAccountK12StatusError(account: Record<string, unknown>, accessToken: string, workspaceIds: string[]): string | undefined {
+  const unwrapped = unwrapSub2ApiAccount(account);
+  const credentials = sub2ApiAccountCredentials(unwrapped);
+  const tokenInfo = accessToken ? summarizeToken(accessToken) : null;
+  return sub2ApiK12StatusErrorReason({
+    planType: asString(
+      credentials.plan_type
+      || credentials.planType
+      || credentials.chatgpt_plan_type
+      || unwrapped.plan_type
+      || unwrapped.planType
+      || tokenInfo?.planType,
+    ),
+    accountId: asString(
+      credentials.chatgpt_account_id
+      || credentials.chatgptAccountId
+      || credentials.account_id
+      || unwrapped.chatgpt_account_id
+      || unwrapped.account_id
+      || tokenInfo?.accountId,
+    ),
+    workspaceIds,
+    status: asString(unwrapped.status),
+    state: asString(unwrapped.state),
+    accountStatus: asString(unwrapped.account_status || unwrapped.accountStatus),
+    disabled: asBoolean(unwrapped.disabled, false),
+    isDisabled: asBoolean(unwrapped.is_disabled ?? unwrapped.isDisabled, false),
+    paused: asBoolean(unwrapped.paused, false),
+    isPaused: asBoolean(unwrapped.is_paused ?? unwrapped.isPaused, false),
+    deleted: asBoolean(unwrapped.deleted, false),
+    isDeleted: asBoolean(unwrapped.is_deleted ?? unwrapped.isDeleted, false),
+    banned: asBoolean(unwrapped.banned, false),
+    isBanned: asBoolean(unwrapped.is_banned ?? unwrapped.isBanned, false),
+    expired: asBoolean(unwrapped.expired, false),
+    isExpired: asBoolean(unwrapped.is_expired ?? unwrapped.isExpired, false),
+    enabled: unwrapped.enabled !== undefined ? asBoolean(unwrapped.enabled, true) : undefined,
+    isEnabled: (unwrapped.is_enabled ?? unwrapped.isEnabled) !== undefined ? asBoolean(unwrapped.is_enabled ?? unwrapped.isEnabled, true) : undefined,
+    active: unwrapped.active !== undefined ? asBoolean(unwrapped.active, true) : undefined,
+    isActive: (unwrapped.is_active ?? unwrapped.isActive) !== undefined ? asBoolean(unwrapped.is_active ?? unwrapped.isActive, true) : undefined,
+    deletedAt: asString(unwrapped.deleted_at || unwrapped.deletedAt),
+  });
+}
+
 function mergeCredentials(existing: Record<string, unknown>, accessToken: string, email: EmailRecord): Record<string, unknown> {
   const next: Record<string, unknown> = {
     ...existing,
@@ -3338,14 +3787,25 @@ function expectedSub2ApiAccountNames(email: EmailRecord, groupName = appConfig.s
   ].filter(Boolean)));
 }
 
-function findAccountByNames(accounts: unknown[], names: string[]): Record<string, unknown> | null {
+function findAccountsByNames(accounts: unknown[], names: string[]): Record<string, unknown>[] {
   const normalizedNames = new Set(names.map((item) => item.toLowerCase()));
+  const found: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
   for (const item of accounts) {
     if (!item || typeof item !== "object") continue;
     const account = unwrapSub2ApiAccount(item as Record<string, unknown>);
-    if (normalizedNames.has(sub2ApiAccountName(account).toLowerCase())) return account;
+    const name = sub2ApiAccountName(account);
+    if (!normalizedNames.has(name.toLowerCase())) continue;
+    const key = sub2ApiAccountId(account) || name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(account);
   }
-  return null;
+  return found;
+}
+
+function findAccountByNames(accounts: unknown[], names: string[]): Record<string, unknown> | null {
+  return findAccountsByNames(accounts, names)[0] || null;
 }
 
 function normalizeSub2ApiOrigin(rawUrl: string): string {
@@ -3403,13 +3863,33 @@ async function loginSub2ApiAdmin(): Promise<{origin: string; token: string}> {
   if (!appConfig.sub2apiUrl || !appConfig.sub2apiEmail || !appConfig.sub2apiPassword) {
     throw new Error("Sub2API 配置不完整：地址、账号、密码均不能为空");
   }
-  const origin = normalizeSub2ApiOrigin(appConfig.sub2apiUrl);
-  const loginData = (await requestSub2ApiJson(origin, "/api/v1/auth/login", {
-    method: "POST",
-    body: {email: appConfig.sub2apiEmail, password: appConfig.sub2apiPassword},
-  })) as Record<string, unknown>;
-  const token = asString(loginData.access_token || loginData.accessToken);
-  if (!token) throw new Error("Sub2API 登录响应缺少 access_token");
+  return loginSub2ApiAdminWithCredentials(appConfig.sub2apiUrl, appConfig.sub2apiEmail, appConfig.sub2apiPassword);
+}
+
+const sub2ApiAdminLoginManager = createSub2ApiAdminLoginManager({
+  authenticate: async ({origin, email, password}) => {
+    const loginData = (await requestSub2ApiJson(origin, "/api/v1/auth/login", {
+      method: "POST",
+      body: {email, password},
+    })) as Record<string, unknown>;
+    const token = asString(loginData.access_token || loginData.accessToken);
+    if (!token) throw new Error("Sub2API 登录响应缺少 access_token");
+    return token;
+  },
+});
+
+async function loginSub2ApiAdminWithCredentials(
+  sub2apiUrl: string,
+  sub2apiEmail: string,
+  sub2apiPassword: string,
+  options: {force?: boolean} = {},
+): Promise<{origin: string; token: string}> {
+  const origin = normalizeSub2ApiOrigin(sub2apiUrl);
+  const token = await sub2ApiAdminLoginManager.login({
+    origin,
+    email: sub2apiEmail,
+    password: sub2apiPassword,
+  }, options);
   return {origin, token};
 }
 
@@ -3509,17 +3989,32 @@ async function findSub2ApiAccountByName(
   adminToken: string,
   names: string[],
 ): Promise<Record<string, unknown> | null> {
+  return (await findSub2ApiAccountsByName(origin, adminToken, names))[0] || null;
+}
+
+async function findSub2ApiAccountsByName(
+  origin: string,
+  adminToken: string,
+  names: string[],
+): Promise<Record<string, unknown>[]> {
   const uniqueNames = Array.from(new Set(names.map((item) => item.trim()).filter(Boolean)));
+  const found: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
   for (const name of uniqueNames) {
     const data = await requestSub2ApiJson(
       origin,
       `/api/v1/admin/accounts?page=1&page_size=20&platform=openai&type=oauth&search=${encodeURIComponent(name)}`,
       {token: adminToken},
     );
-    const found = findAccountByNames(extractItems(data), uniqueNames);
-    if (found) return found;
+    for (const account of findAccountsByNames(extractItems(data), uniqueNames)) {
+      const accountName = sub2ApiAccountName(account);
+      const key = sub2ApiAccountId(account) || accountName.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      found.push(account);
+    }
   }
-  return null;
+  return found;
 }
 
 function buildQueryString(params: Record<string, string | number | boolean | undefined>): string {
@@ -3786,12 +4281,20 @@ function sub2ApiRefillStatus(): Record<string, unknown> {
     lastCheckedAt: sub2apiRefillLastCheckedAt,
     lastError: sub2apiRefillLastError,
     lastResult: sub2apiRefillLastResult,
+    autoAtRepair: {
+      enabled: appConfig?.sub2apiAutoAtRepairEnabled === true,
+      running: sub2apiAutoAtRepairRunning,
+      lastCheckedAt: sub2apiAutoAtRepairLastCheckedAt,
+      lastError: sub2apiAutoAtRepairLastError,
+      lastResult: sub2apiAutoAtRepairLastResult,
+    },
     history: sub2apiRefillHistory.slice(0, 50),
   };
 }
 
 function updateSub2ApiRefillNextCheck(): void {
-  sub2apiRefillNextCheckAt = appConfig?.sub2apiAutoRefillEnabled
+  const enabled = appConfig?.sub2apiAutoRefillEnabled || appConfig?.sub2apiAutoAtRepairEnabled;
+  sub2apiRefillNextCheckAt = enabled
     ? new Date(Date.now() + Math.max(10000, appConfig.sub2apiRefillIntervalMs)).toISOString()
     : "";
 }
@@ -3801,7 +4304,7 @@ function configureSub2ApiRefillTimer(): void {
     clearInterval(sub2apiRefillTimer);
     sub2apiRefillTimer = undefined;
   }
-  if (!appConfig?.sub2apiAutoRefillEnabled) {
+  if (!appConfig?.sub2apiAutoRefillEnabled && !appConfig?.sub2apiAutoAtRepairEnabled) {
     sub2apiRefillNextCheckAt = "";
     return;
   }
@@ -3809,11 +4312,18 @@ function configureSub2ApiRefillTimer(): void {
   updateSub2ApiRefillNextCheck();
   sub2apiRefillTimer = setInterval(() => {
     updateSub2ApiRefillNextCheck();
-    if (sub2apiRefillRunning) return;
-    void runSub2ApiRefill("timer").catch((error) => {
-      sub2apiRefillLastError = error instanceof Error ? error.message : String(error);
-      console.error(`[sub2api-refill] ${sub2apiRefillLastError}`);
-    });
+    if (appConfig.sub2apiAutoRefillEnabled && !sub2apiRefillRunning) {
+      void runSub2ApiRefill("timer").catch((error) => {
+        sub2apiRefillLastError = error instanceof Error ? error.message : String(error);
+        console.error(`[sub2api-refill] ${sub2apiRefillLastError}`);
+      });
+    }
+    if (appConfig.sub2apiAutoAtRepairEnabled && !sub2apiAutoAtRepairRunning) {
+      void runSub2ApiAutoAtRepair("timer").catch((error) => {
+        sub2apiAutoAtRepairLastError = error instanceof Error ? error.message : String(error);
+        console.error(`[sub2api-auto-at-repair] ${sub2apiAutoAtRepairLastError}`);
+      });
+    }
   }, intervalMs);
 }
 
@@ -3958,6 +4468,133 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
   }
 }
 
+function sub2ApiAccountK12RepairIssue(account: Record<string, unknown>): {issue: K12RepairIssue; message: string} | null {
+  const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
+  const statusError = sub2ApiAccountK12StatusError(account, accessToken, appConfig.workspaceIds);
+  if (statusError) {
+    return {issue: SUB2API_K12_STATUS_ERROR_ISSUE, message: statusError};
+  }
+  const planMismatch = sub2ApiAccountK12PlanMismatch(account, accessToken, appConfig.workspaceIds);
+  if (planMismatch) {
+    return {issue: K12_PLAN_MISMATCH_ISSUE, message: planMismatch};
+  }
+  return null;
+}
+
+function findLocalEmailForSub2ApiAccount(account: Record<string, unknown>): EmailRecord | undefined {
+  const accountName = sub2ApiAccountName(account).toLowerCase();
+  if (accountName) {
+    const bySavedAccount = emails.find((email) => asString(email.sub2apiAccount).toLowerCase() === accountName);
+    if (bySavedAccount) return bySavedAccount;
+  }
+
+  const credentials = sub2ApiAccountCredentials(account);
+  const candidates = new Set<string>(sub2ApiAccountEmailCandidatesFromName(accountName));
+  for (const value of [
+    credentials.email,
+    credentials.account_email,
+    credentials.accountEmail,
+    credentials.chatgpt_email,
+    credentials.chatgptEmail,
+  ]) {
+    const email = asString(value).toLowerCase();
+    if (email) candidates.add(email);
+  }
+  if (!candidates.size) return undefined;
+  return emails.find((email) => candidates.has(email.email.toLowerCase()));
+}
+
+async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2ApiAutoAtRepairResult> {
+  if (sub2apiAutoAtRepairRunning) {
+    throw new Error("Sub2API 自动补 AT 正在运行，请稍后再试");
+  }
+  sub2apiAutoAtRepairRunning = true;
+  sub2apiAutoAtRepairLastCheckedAt = nowIso();
+  sub2apiAutoAtRepairLastError = "";
+  try {
+    await reconcileAndPersistEmailStatuses();
+    const groupName = primarySub2ApiGroupName(appConfig.sub2apiRefillGroupName || appConfig.sub2apiGroupName || "k12");
+    const {origin, token: adminToken} = await loginSub2ApiAdmin();
+    const [group] = await resolveSub2ApiGroups(origin, adminToken, [groupName]);
+    if (!group) throw new Error(`Sub2API 未找到自动补 AT 分组: ${groupName}`);
+
+    const listed = await listSub2ApiAccountsForGroup(origin, adminToken, group);
+    const samples: string[] = [];
+    const queuedEmailIds = new Set<string>();
+    let issueAccounts = 0;
+    let matchedEmails = 0;
+    let createdTasks = 0;
+    let skippedRunning = 0;
+    let skippedUnmatched = 0;
+
+    for (const account of listed.matchedAccounts) {
+      const issue = sub2ApiAccountK12RepairIssue(account);
+      if (!issue) continue;
+      if (!isAutoAtRepairIssue(issue.issue)) continue;
+      issueAccounts += 1;
+      const accountName = sub2ApiAccountName(account) || "(unnamed)";
+      const localEmail = findLocalEmailForSub2ApiAccount(account);
+      if (!localEmail) {
+        skippedUnmatched += 1;
+        if (samples.length < 10) samples.push(`${accountName}: ${issue.message}，未匹配到本地邮箱`);
+        continue;
+      }
+      matchedEmails += 1;
+      const canCreate = shouldCreateAutoAtRepairTask({
+        issue: issue.issue,
+        matchedLocalEmail: true,
+        emailStatus: localEmail.status,
+        hasActiveTask: hasActiveTask(localEmail.id) || queuedEmailIds.has(localEmail.id),
+      });
+      if (!canCreate) {
+        skippedRunning += 1;
+        if (samples.length < 10) samples.push(`${localEmail.email}: ${issue.message}，已有任务或邮箱不可用`);
+        continue;
+      }
+      const created = createAtRepairTasks({
+        emailIds: [localEmail.id],
+        sub2apiGroupName: group.name,
+      });
+      const task = created.created[0];
+      if (task) {
+        queuedEmailIds.add(localEmail.id);
+        createdTasks += 1;
+        appendLog(task, "info", `自动补 AT 来源: ${accountName}; ${issue.message}`);
+        if (samples.length < 10) samples.push(`${localEmail.email}: ${issue.message}，已创建 ${task.id}`);
+      } else {
+        skippedRunning += created.skippedRunning || 1;
+        if (samples.length < 10) samples.push(`${localEmail.email}: ${issue.message}，未创建修复任务`);
+      }
+    }
+
+    const message = issueAccounts
+      ? `自动补 AT 扫描 ${listed.matchedAccounts.length} 个账号，发现 K12 错误 ${issueAccounts} 个，已创建修复任务 ${createdTasks} 个`
+      : `自动补 AT 扫描 ${listed.matchedAccounts.length} 个账号，未发现 K12 错误`;
+    const result: Sub2ApiAutoAtRepairResult = {
+      checkedAt: sub2apiAutoAtRepairLastCheckedAt,
+      source,
+      groupName: group.name,
+      groupLabel: `${group.name}#${group.id}`,
+      scannedAccounts: listed.matchedAccounts.length,
+      issueAccounts,
+      matchedEmails,
+      createdTasks,
+      skippedRunning,
+      skippedUnmatched,
+      message,
+      samples,
+    };
+    sub2apiAutoAtRepairLastResult = result;
+    return result;
+  } catch (error) {
+    sub2apiAutoAtRepairLastError = error instanceof Error ? error.message : String(error);
+    throw error;
+  } finally {
+    sub2apiAutoAtRepairRunning = false;
+    updateSub2ApiRefillNextCheck();
+  }
+}
+
 async function testOpenAiAccessToken(accessToken: string, model = DEFAULT_AT_LIVENESS_MODEL): Promise<{ok: boolean; status: number; message: string; latencyMs: number; banned?: boolean}> {
   const tokenInfo = summarizeToken(accessToken);
   const startedAt = Date.now();
@@ -4053,9 +4690,11 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
     accountName: string;
     accountId: string;
     ok: boolean;
+    issue?: K12RepairIssue;
     status: number;
     message: string;
     latencyMs: number;
+    repairTaskId?: string;
   }>;
   ok: number;
   failed: number;
@@ -4070,15 +4709,19 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
   const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
   const selectedEmails = emails.filter((item) => requested.has(item.id));
   const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
+  const onlyK12RepairIssues = body.onlyK12RepairIssues === true || body.onlyK12Mismatch === true;
+  const autoCreateRepairTasks = body.autoCreateRepairTasks !== false;
   const items: Array<{
     emailId: string;
     email: string;
     accountName: string;
     accountId: string;
     ok: boolean;
+    issue?: K12RepairIssue;
     status: number;
     message: string;
     latencyMs: number;
+    repairTaskId?: string;
   }> = [];
   let skippedRunning = 0;
   let changedEmails = false;
@@ -4096,6 +4739,7 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
       const names = expectedSub2ApiAccountNames(email, sub2apiGroupName);
       const account = await findSub2ApiAccountByName(origin, adminToken, names);
       if (!account) {
+        if (onlyK12RepairIssues) continue;
         const message = `Sub2API 未找到账号: ${names.join(" / ")}`;
         items.push({
           emailId: email.id,
@@ -4118,6 +4762,7 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
         changedEmails = true;
       }
       if (!accountId) {
+        if (onlyK12RepairIssues) continue;
         items.push({
           emailId: email.id,
           email: email.email,
@@ -4132,9 +4777,63 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
       }
 
       const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
-      const result = accessToken
-        ? await testOpenAiAccessToken(accessToken)
-        : await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+      const k12StatusError = sub2ApiAccountK12StatusError(account, accessToken, appConfig.workspaceIds);
+      if (k12StatusError) {
+        items.push({
+          emailId: email.id,
+          email: email.email,
+          accountName,
+          accountId,
+          ok: false,
+          issue: SUB2API_K12_STATUS_ERROR_ISSUE,
+          status: 409,
+          message: k12StatusError,
+          latencyMs: Date.now() - startedAt,
+        });
+        continue;
+      }
+
+      const planMismatch = sub2ApiAccountK12PlanMismatch(account, accessToken, appConfig.workspaceIds);
+      if (planMismatch) {
+        const created = autoCreateRepairTasks
+          ? createAtRepairTasks({
+            emailIds: [email.id],
+            sub2apiGroupName,
+          })
+          : {created: [], skippedRunning: 0};
+        const repairTask = created.created[0];
+        const message = repairTask
+          ? `${planMismatch}，已自动创建 AT 修复任务 ${repairTask.id}`
+          : autoCreateRepairTasks
+            ? `${planMismatch}，但 AT 修复任务未创建${created.skippedRunning ? "：该邮箱已有运行中任务" : ""}`
+            : planMismatch;
+        items.push({
+          emailId: email.id,
+          email: email.email,
+          accountName,
+          accountId,
+          ok: false,
+          issue: K12_PLAN_MISMATCH_ISSUE,
+          status: 409,
+          message,
+          latencyMs: Date.now() - startedAt,
+          repairTaskId: repairTask?.id,
+        });
+        continue;
+      }
+      if (onlyK12RepairIssues) continue;
+      let result: AccessTokenLivenessResult;
+      if (accessToken) {
+        const directResult = await testOpenAiAccessToken(accessToken);
+        if (shouldTrySub2LivenessAfterDirectFailure(directResult)) {
+          const sub2apiResult = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+          result = combineDirectAndSub2Liveness(directResult, sub2apiResult);
+        } else {
+          result = directResult;
+        }
+      } else {
+        result = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+      }
       items.push({
         emailId: email.id,
         email: email.email,
@@ -4146,6 +4845,7 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
         latencyMs: result.latencyMs,
       });
     } catch (error) {
+      if (onlyK12RepairIssues) continue;
       items.push({
         emailId: email.id,
         email: email.email,
@@ -4181,8 +4881,8 @@ async function checkTaskAccessToken(task: K12Task): Promise<{
 function isInactiveAccessTokenResult(result: {ok: boolean; status: number; message: string; banned?: boolean}): boolean {
   if (result.ok) return false;
   if (result.banned) return true;
-  if (result.status === 401 || result.status === 403) return true;
-  return /unauthorized|invalid[_ -]?token|token.*expired|access.*denied|account.*(?:deactivated|disabled|suspended|banned)|封号|停用|被封禁/i.test(result.message);
+  if (result.status === 401 || result.status === 403 || result.status === 409) return true;
+  return /unauthorized|invalid[_ -]?token|token.*expired|access.*denied|套餐不是\s*K12|account.*(?:deactivated|disabled|suspended|banned)|封号|停用|被封禁/i.test(result.message);
 }
 
 function recordTaskAccessTokenLiveness(
@@ -4232,15 +4932,58 @@ async function checkTaskAccessTokenWithOptions(
   }
 
   appendLog(task, "info", "开始使用任务保存的 AT 测活");
-  const result = await testOpenAiAccessToken(task.accessToken);
+  let result: AccessTokenLivenessResult = await testOpenAiAccessToken(task.accessToken);
+  if (result.ok && !isK12AccessToken(task.accessToken, task)) {
+    result = {
+      ok: false,
+      status: 409,
+      message: `任务 AT 套餐不是 K12: ${describeAccessTokenContext(task.accessToken)}`,
+      latencyMs: result.latencyMs,
+    };
+  }
+  if (shouldTrySub2LivenessAfterDirectFailure(result)) {
+    try {
+      appendLog(task, "info", "直接 AT 返回授权失败，改查 Sub2API 账号测活");
+      const {origin, token: adminToken} = await loginSub2ApiAdmin();
+      const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName);
+      const matchedAccounts = await findSub2ApiAccountsByName(origin, adminToken, names);
+      const account = matchedAccounts[0];
+      const accountId = account ? sub2ApiAccountId(account) : "";
+      const accountName = account ? sub2ApiAccountName(account) : "";
+      if (account && accountId) {
+        if (accountName) {
+          task.sub2apiAccount = accountName;
+          email.sub2apiAccount = accountName;
+        }
+        const planMismatch = sub2ApiAccountK12PlanMismatch(account, extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account)), targetK12WorkspaceIds(task));
+        if (planMismatch) {
+          result = {
+            ok: false,
+            status: 409,
+            message: planMismatch,
+            latencyMs: result.latencyMs,
+          };
+          appendLog(task, "warn", planMismatch);
+        } else {
+        const sub2apiResult = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+        appendLog(task, sub2apiResult.ok ? "ok" : "warn", `Sub2API 账号测活: ${sub2apiResult.message}`);
+        result = combineDirectAndSub2Liveness(result, sub2apiResult);
+        }
+      } else {
+        appendLog(task, "warn", `Sub2API 未找到可测活账号: ${names.join(" / ")}`);
+      }
+    } catch (error) {
+      appendLog(task, "warn", `Sub2API fallback 测活失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   recordTaskAccessTokenLiveness(task, result);
   appendLog(task, result.ok ? "ok" : "warn", `任务 AT 测活: ${result.message}`);
 
   let repairTask: K12Task | undefined;
   if (result.banned) {
     markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止继续获取 AT", task);
-  } else if (options.autoRepair !== false && !result.ok && result.status === 401) {
-    appendLog(task, "warn", "AT 返回 401，自动创建 AT 修复任务");
+  } else if (options.autoRepair !== false && !result.ok && (result.status === 401 || result.status === 409)) {
+    appendLog(task, "warn", `${result.status === 409 ? "AT 套餐不是 K12" : "AT 返回 401"}，自动创建 AT 修复任务`);
     const created = createAtRepairTasks({
       emailIds: [task.emailId],
       sub2apiGroupName: task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12",
@@ -4554,7 +5297,12 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
     fetchOtp = (label: string) => waitForManualEmailOtp(task, email, label);
   } else if (email.otpMode === "smsbower-mail") {
     appendLog(task, "info", `当前邮箱为 SMSBower Gmail 动态接码模式: ${email.smsBowerMailId || "-"}`);
-    fetchOtp = (label: string) => waitForSmsBowerMailCode(email, task, label);
+    fetchOtp = async (label: string) => {
+      if (shouldRequestSmsBowerNextCodeBeforeWait({retryAfterWrongOtp: false})) {
+        await requestSmsBowerNextMailCode(email, task, `${label}前准备等待验证码`);
+      }
+      return waitForSmsBowerMailCode(email, task, label);
+    };
   } else if (email.otpMode === "emailnator") {
     appendLog(task, "info", `当前邮箱为 Emailnator Gmail 动态接码模式: ${email.email}`);
     fetchOtp = (label: string) => waitForEmailnatorCode(email, task, label);
@@ -4569,11 +5317,14 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
 
     fetchOtp = async (label: string) => {
       appendLog(task, "info", `等待 ${label} 验证码: ${email.email}`);
+      const retryAfterWrongOtp = task.freshEmailOtpOnlyOnce === true;
+      task.freshEmailOtpOnlyOnce = false;
+      if (retryAfterWrongOtp) {
+        appendLog(task, "info", "本次只接受新验证码，不再使用邮箱基线旧验证码兜底");
+      }
       const code = await mailboxProvider.waitForCode({
         baseline,
-        timeoutMs: 120000,
-        intervalMs: 3000,
-        allowBaselineCodeAfterMs: 45000,
+        ...mailboxOtpWaitOptions({retryAfterWrongOtp}),
       });
       appendLog(task, "ok", `${label} 验证码已获取`);
       try {
@@ -5044,6 +5795,7 @@ async function runTask(task: K12Task): Promise<void> {
     process.env.DEFAULT_PROXY_URL = appConfig.defaultProxyUrl || "direct";
     process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
     await ensureSentinelSdk();
+    await waitForPoolFissionChildCooldown(task, email);
 
     const client = await createOpenAIClientForEmail(task, email);
     const useNoRtMode = task.sub2apiNoRtMode === true;
@@ -5156,7 +5908,10 @@ async function runTask(task: K12Task): Promise<void> {
     email.status = "success";
     appendLog(task, "ok", "任务完成");
   } catch (error) {
-    const message = normalizeFlowError(error);
+    let message = normalizeFlowError(error);
+    if (email.otpMode === "smsbower-mail" && isSmsBowerActivationCanceledMessage(message)) {
+      message = smsBowerClosedByRemoteStatusReason(email);
+    }
     task.status = task.cancelRequested ? "canceled" : "failed";
     task.error = message;
     if (isOpenAiAccountBannedMessage(message)) {
@@ -5176,8 +5931,14 @@ async function runTask(task: K12Task): Promise<void> {
     await enqueueNextSmsBowerFissionTask(email, task).catch((error) => {
       appendLog(task, "warn", `SMSBower Gmail 裂变子任务创建失败: ${error instanceof Error ? error.message : String(error)}`);
     });
+    await enqueueNextPoolFissionTask(email, task).catch((error) => {
+      appendLog(task, "warn", `邮箱池裂变子任务创建失败: ${error instanceof Error ? error.message : String(error)}`);
+    });
     await finalizeSmsBowerMailIfDone(email).catch((error) => {
       appendLog(task, "warn", `SMSBower 邮箱释放失败: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    await enqueueReplacementSmsBowerMailTask(email, task).catch((error) => {
+      appendLog(task, "warn", `SMSBower 自动换邮箱失败: ${error instanceof Error ? error.message : String(error)}`);
     });
     scheduleTasks();
   }
@@ -5218,7 +5979,8 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
     const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName);
     appendLog(task, "info", `按名称查找 Sub2API 账号: ${names.join(" / ")}`);
-    const account = await findSub2ApiAccountByName(origin, adminToken, names);
+    const matchedAccounts = await findSub2ApiAccountsByName(origin, adminToken, names);
+    const account = matchedAccounts[0];
     if (!account) {
       appendLog(task, "warn", `Sub2API 未找到账号，改为重新获取 K12 AT 后新增账号: ${names.join(" / ")}`);
       const client = await createOpenAIClientForEmail(task, email);
@@ -5241,7 +6003,7 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     if (!accountId) throw new Error(`Sub2API 账号缺少 id: ${accountName || "(unknown)"}`);
     task.sub2apiAccount = accountName;
     email.sub2apiAccount = accountName;
-    appendLog(task, "info", `已找到 Sub2API 账号: ${accountName}#${accountId}`);
+    appendLog(task, "info", `已找到 Sub2API 账号: ${accountName}#${accountId}${matchedAccounts.length > 1 ? `，同名账号 ${matchedAccounts.length} 个` : ""}`);
 
     const credentials = sub2ApiAccountCredentials(account);
     const oldAccessToken = extractAccessTokenFromCredentials(credentials);
@@ -5291,13 +6053,15 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     recordAccessToken(task, email, newAccessToken);
     await appendTokenOut(newAccessToken);
 
-    await updateSub2ApiAccountAccessToken(origin, adminToken, account, email, newAccessToken);
+    for (const matchedAccount of matchedAccounts) {
+      await updateSub2ApiAccountAccessToken(origin, adminToken, matchedAccount, email, newAccessToken);
+    }
     await tryWriteAccountJsonFile(task, email, newAccessToken, {
       credentials,
       accountName,
       source: "gpt-k12-at-repair-updated",
     });
-    appendLog(task, "ok", `Sub2API 账号 AT 已更新: ${accountName}#${accountId}`);
+    appendLog(task, "ok", `Sub2API 账号 AT 已更新: ${accountName}#${accountId}${matchedAccounts.length > 1 ? ` 等 ${matchedAccounts.length} 个同名账号` : ""}`);
     task.status = "success";
     email.status = "success";
   } catch (error) {
@@ -5327,12 +6091,25 @@ function scheduleTasks(): void {
   for (const task of tasks) {
     if (task.status !== "queued") continue;
     const email = emails.find((item) => item.id === task.emailId);
-    if (email?.status !== "banned") continue;
-    task.status = "failed";
-    task.error = email.lastError || "邮箱已标记封号，队列任务跳过";
-    task.finishedAt = nowIso();
-    task.updatedAt = nowIso();
-    appendLog(task, "error", task.error);
+    if (email?.status === "banned") {
+      task.status = "failed";
+      task.error = email.lastError || "邮箱已标记封号，队列任务跳过";
+      task.finishedAt = nowIso();
+      task.updatedAt = nowIso();
+      appendLog(task, "error", task.error);
+      continue;
+    }
+    if (shouldSkipDuplicateQueuedTask({
+      taskKind: task.kind || "k12",
+      taskStatus: task.status,
+      hasPriorSuccess: hasPriorSuccessfulK12Task(task.emailId, task.id),
+    })) {
+      task.status = "canceled";
+      task.error = "该邮箱已有成功任务，跳过重复队列任务";
+      task.finishedAt = nowIso();
+      task.updatedAt = nowIso();
+      appendLog(task, "warn", task.error);
+    }
   }
   while (activeWorkers < limit) {
     const activeRoots = new Set(
@@ -5363,6 +6140,11 @@ function enqueueK12Task(
     sub2apiNoRtMode: boolean;
     sub2apiGroupName: string;
     fissionRemainingAfterThis?: number;
+    smsBowerAutoReplaceOnFailure?: boolean;
+    smsBowerReplacementRemaining?: number;
+    smsBowerReplacementSourceTaskId?: string;
+    smsBowerBatchId?: string;
+    smsBowerBatchTargetSuccesses?: number;
   },
 ): K12Task {
   const task: K12Task = {
@@ -5378,6 +6160,11 @@ function enqueueK12Task(
     sub2apiNoRtMode: options.sub2apiNoRtMode,
     sub2apiGroupName: options.sub2apiGroupName,
     smsBowerFissionRemainingAfterThis: options.fissionRemainingAfterThis,
+    smsBowerAutoReplaceOnFailure: options.smsBowerAutoReplaceOnFailure,
+    smsBowerReplacementRemaining: options.smsBowerReplacementRemaining,
+    smsBowerReplacementSourceTaskId: options.smsBowerReplacementSourceTaskId,
+    smsBowerBatchId: options.smsBowerBatchId,
+    smsBowerBatchTargetSuccesses: options.smsBowerBatchTargetSuccesses,
     createdAt: nowIso(),
     updatedAt: nowIso(),
     workspaceResults: [],
@@ -5389,13 +6176,91 @@ function enqueueK12Task(
   return task;
 }
 
-async function createTasks(body: Record<string, unknown>): Promise<{created: K12Task[]; skippedRunning: number; missing: number}> {
+async function enqueueReplacementSmsBowerMailTask(email: EmailRecord, sourceTask: K12Task): Promise<K12Task | undefined> {
+  if (sourceTask.smsBowerBatchId) {
+    const batchTasks = tasks.filter((item) => item.smsBowerBatchId === sourceTask.smsBowerBatchId);
+    const successfulTasks = batchTasks.filter((item) => item.status === "success").length;
+    const activeTasks = batchTasks.filter((item) => (
+      item.id !== sourceTask.id
+      && !item.cancelRequested
+      && (item.status === "queued" || item.status === "running")
+    )).length;
+    if (!shouldEnqueueSmsBowerBatchReplacement({
+      targetSuccesses: sourceTask.smsBowerBatchTargetSuccesses,
+      successfulTasks,
+      activeTasks,
+    })) {
+      appendLog(sourceTask, "info", `SMSBower 批次 ${sourceTask.smsBowerBatchId.slice(-8)} 已达到或已有足够任务在跑：成功 ${successfulTasks}/${sourceTask.smsBowerBatchTargetSuccesses || 0}，运行/排队 ${activeTasks}`);
+      return undefined;
+    }
+  }
+
+  if (!shouldAutoReplaceSmsBowerMailFailure({
+    otpMode: email.otpMode,
+    smsBowerMailId: email.smsBowerMailId,
+    autoReplace: sourceTask.smsBowerAutoReplaceOnFailure,
+    replacementRemaining: sourceTask.smsBowerBatchId ? 1 : sourceTask.smsBowerReplacementRemaining,
+    taskStatus: sourceTask.status,
+    error: sourceTask.error,
+  })) {
+    return undefined;
+  }
+
+  const remaining = sourceTask.smsBowerBatchId
+    ? sourceTask.smsBowerReplacementRemaining
+    : Math.max(0, (sourceTask.smsBowerReplacementRemaining || 0) - 1);
+  const [replacement] = await createSmsBowerMailRecords(1);
+  if (!replacement) return undefined;
+
+  const task = enqueueK12Task(replacement, {
+    route: sourceTask.route,
+    workspaceIds: sourceTask.workspaceIds,
+    runWorkspaceJoin: sourceTask.runWorkspaceJoin,
+    runSub2Api: sourceTask.runSub2Api,
+    sub2apiNoRtMode: sourceTask.sub2apiNoRtMode === true,
+    sub2apiGroupName: sourceTask.sub2apiGroupName || appConfig.sub2apiGroupName || "k12",
+    fissionRemainingAfterThis: poolFissionRemainingForNewTask({
+      enabled: appConfig.smsBowerGmailFissionEnabled,
+      count: appConfig.smsBowerGmailFissionCount,
+      isChildEmail: false,
+      isSmsBowerMail: true,
+      existingRemaining: replacement.smsBowerFissionChildrenRemaining,
+    }),
+    smsBowerAutoReplaceOnFailure: true,
+    smsBowerReplacementRemaining: remaining,
+    smsBowerReplacementSourceTaskId: sourceTask.id,
+    smsBowerBatchId: sourceTask.smsBowerBatchId,
+    smsBowerBatchTargetSuccesses: sourceTask.smsBowerBatchTargetSuccesses,
+  });
+  const batchSuffix = sourceTask.smsBowerBatchId
+    ? `，批次目标 ${sourceTask.smsBowerBatchTargetSuccesses || 0} 个成功`
+    : `，剩余自动替换 ${remaining} 次`;
+  appendLog(sourceTask, "warn", `SMSBower 邮箱不可用，已自动换下一个: ${replacement.email}${batchSuffix}`);
+  appendLog(task, "info", `自动换 SMSBower 邮箱，来源失败任务 ${sourceTask.id}${batchSuffix}`);
+  await Promise.all([persistTasks(), persistEmails()]);
+  return task;
+}
+
+type TaskCreateSkipReason = "missing" | "smsbowerClosed" | "googleSsoUnsupported" | "running" | "banned" | "success" | "active";
+
+function addTaskCreateSkipReason(reasons: Partial<Record<TaskCreateSkipReason, number>>, reason: TaskCreateSkipReason, count = 1): void {
+  reasons[reason] = (reasons[reason] || 0) + count;
+}
+
+async function createTasks(body: Record<string, unknown>): Promise<{
+  created: K12Task[];
+  skippedRunning: number;
+  missing: number;
+  skippedReasons: Partial<Record<TaskCreateSkipReason, number>>;
+}> {
   const requestedEmailIds = Array.isArray(body.emailIds)
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
     : [];
   const requested = new Set(requestedEmailIds);
   const existingIds = new Set(emails.map((item) => item.id));
   const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
+  const skippedReasons: Partial<Record<TaskCreateSkipReason, number>> = {};
+  if (missing) addTaskCreateSkipReason(skippedReasons, "missing", missing);
   const dynamicGmailMode = !requestedEmailIds.length && appConfig.smsBowerMailEnabled;
   let selectedEmails = requestedEmailIds.length
     ? emails.filter((item) => requested.has(item.id))
@@ -5415,10 +6280,31 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
   const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
   const created: K12Task[] = [];
   let skippedRunning = 0;
+  const smsBowerBatchId = dynamicGmailMode && appConfig.gmailMailProvider === "smsbower"
+    ? `smsbatch_${Date.now()}_${randomUUID().slice(0, 8)}`
+    : undefined;
 
   for (const email of selectedEmails.slice(0, limit)) {
-    if (email.status === "running" || email.status === "banned" || hasActiveTask(email.id)) {
+    const smsBowerBlockedReason = smsBowerActivationBlockReason(email);
+    if (smsBowerBlockedReason) {
+      email.status = "failed";
+      email.lastError = smsBowerBlockedReason;
+      email.updatedAt = nowIso();
       skippedRunning += 1;
+      addTaskCreateSkipReason(skippedReasons, "smsbowerClosed");
+      continue;
+    }
+    if (email.otpMode === "smsbower-mail" && isGoogleSsoUnsupportedMessage(email.lastError)) {
+      email.status = "failed";
+      email.updatedAt = nowIso();
+      skippedRunning += 1;
+      addTaskCreateSkipReason(skippedReasons, "googleSsoUnsupported");
+      continue;
+    }
+    const skipReason = taskCreationSkipReason({emailStatus: email.status, hasActiveTask: hasActiveTask(email.id)});
+    if (skipReason) {
+      skippedRunning += 1;
+      addTaskCreateSkipReason(skippedReasons, skipReason);
       continue;
     }
     const pickedWorkspaceId = randomItem(workspaceCandidates);
@@ -5430,7 +6316,19 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
       runSub2Api,
       sub2apiNoRtMode,
       sub2apiGroupName,
-      fissionRemainingAfterThis: email.smsBowerFissionChildrenRemaining,
+      fissionRemainingAfterThis: poolFissionRemainingForNewTask({
+        enabled: appConfig.smsBowerGmailFissionEnabled,
+        count: appConfig.smsBowerGmailFissionCount,
+        isChildEmail: Boolean(email.parentEmail),
+        isSmsBowerMail: email.otpMode === "smsbower-mail",
+        existingRemaining: email.smsBowerFissionChildrenRemaining,
+      }),
+      smsBowerAutoReplaceOnFailure: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower",
+      smsBowerReplacementRemaining: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower"
+        ? DEFAULT_SMSBOWER_AUTO_REPLACEMENT_LIMIT
+        : undefined,
+      smsBowerBatchId,
+      smsBowerBatchTargetSuccesses: smsBowerBatchId ? limit : undefined,
     });
     appendLog(
       task,
@@ -5441,7 +6339,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
   }
   void Promise.all([persistTasks(), persistEmails()]);
   scheduleTasks();
-  return {created, skippedRunning, missing};
+  return {created, skippedRunning, missing, skippedReasons};
 }
 
 function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]; skippedRunning: number; missing: number; skippedNoAccount: number} {
@@ -5499,6 +6397,14 @@ function retryTask(source: K12Task): K12Task {
   if (!email) throw new Error("邮箱记录不存在");
   if (email.status === "running") throw new Error("该邮箱当前正在运行，不能重复重试");
   if (email.status === "banned") throw new Error("该邮箱已标记封号，不能重试");
+  if (email.status === "success") throw new Error("该邮箱已成功，不需要重试");
+  const smsBowerBlockedReason = smsBowerActivationBlockReason(email);
+  if (smsBowerBlockedReason) {
+    email.status = "failed";
+    email.lastError = smsBowerBlockedReason;
+    email.updatedAt = nowIso();
+    throw new Error(smsBowerBlockedReason);
+  }
 
   const task: K12Task = {
     id: `k12_${Date.now()}_${randomUUID().slice(0, 8)}`,
@@ -5512,6 +6418,11 @@ function retryTask(source: K12Task): K12Task {
     runSub2Api: source.runSub2Api,
     sub2apiNoRtMode: source.sub2apiNoRtMode === true,
     sub2apiGroupName: source.sub2apiGroupName || appConfig.sub2apiGroupName || "k12",
+    smsBowerAutoReplaceOnFailure: source.smsBowerAutoReplaceOnFailure,
+    smsBowerReplacementRemaining: source.smsBowerReplacementRemaining,
+    smsBowerReplacementSourceTaskId: source.smsBowerReplacementSourceTaskId,
+    smsBowerBatchId: source.smsBowerBatchId,
+    smsBowerBatchTargetSuccesses: source.smsBowerBatchTargetSuccesses,
     createdAt: nowIso(),
     updatedAt: nowIso(),
     workspaceResults: [],
@@ -5525,6 +6436,28 @@ function retryTask(source: K12Task): K12Task {
   void Promise.all([persistTasks(), persistEmails()]);
   scheduleTasks();
   return task;
+}
+
+function retryFailedTasks(): {created: K12Task[]; skipped: number; failed: Array<{taskId: string; email: string; error: string}>} {
+  const failedTasks = tasks.filter((task) => task.status === "failed");
+  const created: K12Task[] = [];
+  const failed: Array<{taskId: string; email: string; error: string}> = [];
+  let skipped = 0;
+
+  for (const task of failedTasks) {
+    try {
+      created.push(retryTask(task));
+    } catch (error) {
+      skipped += 1;
+      failed.push({
+        taskId: task.id,
+        email: task.email,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return {created, skipped, failed};
 }
 
 function clearFailedTasks(): {removed: number} {
@@ -5542,8 +6475,14 @@ function clearFailedTasks(): {removed: number} {
 }
 
 function publicTask(task: K12Task): Record<string, unknown> {
+  const email = emails.find((item) => item.id === task.emailId);
   return {
     ...task,
+    parentEmail: email?.parentEmail,
+    otpMode: email?.otpMode || "auto",
+    smsBowerMailRoot: email?.smsBowerMailRoot,
+    smsBowerFissionChildrenRemaining: email?.smsBowerFissionChildrenRemaining,
+    smsBowerFissionParentEmailId: email?.smsBowerFissionParentEmailId,
     logs: task.logs.slice(-240),
   };
 }
@@ -5575,6 +6514,13 @@ function reconcileEmailStatusesFromTasks(): boolean {
   let changed = false;
   for (const email of emails) {
     if (email.status === "banned") continue;
+    if (email.otpMode === "smsbower-mail" && isGoogleSsoUnsupportedMessage(email.lastError)) {
+      const nextError = googleSsoUnsupportedReason();
+      if (email.lastError !== nextError) {
+        email.lastError = nextError;
+        changed = true;
+      }
+    }
     const related = tasks
       .filter((task) => task.emailId === email.id)
       .sort((a, b) => String(b.finishedAt || b.updatedAt || b.createdAt).localeCompare(String(a.finishedAt || a.updatedAt || a.createdAt)));
@@ -5622,7 +6568,10 @@ function reconcileEmailStatusesFromTasks(): boolean {
         email.lastTaskId = latestFailed.id;
         changed = true;
       }
-      const nextError = latestFailed.error || email.lastError || "";
+      const rawError = latestFailed.error || email.lastError || "";
+      const nextError = isSmsBowerActivationCanceledMessage(rawError) && email.otpMode === "smsbower-mail"
+        ? smsBowerClosedByRemoteStatusReason(email)
+        : rawError;
       if (email.lastError !== nextError) {
         email.lastError = nextError;
         changed = true;
@@ -5763,6 +6712,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (method === "POST" && pathname === "/api/sub2api/auto-at-repair/start") {
+    try {
+      const result = await runSub2ApiAutoAtRepair("manual");
+      sendJson(res, 200, {result, status: sub2ApiRefillStatus(), summary: summary()});
+    } catch (error) {
+      sendJson(res, 409, {error: error instanceof Error ? error.message : String(error), status: sub2ApiRefillStatus()});
+    }
+    return;
+  }
+
   if (method === "POST" && pathname === "/api/emails/reconcile") {
     const changed = await reconcileAndPersistEmailStatuses();
     sendJson(res, 200, {changed, summary: summary()});
@@ -5792,13 +6751,28 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   if ((method === "PATCH" || method === "POST") && pathname === "/api/config") {
     const body = await readJsonBody(req);
+    const nextSub2ApiPassword = asString(body.sub2apiPassword);
     const merged = normalizeConfig({
       ...appConfig,
       ...body,
       defaultPassword: asString(body.defaultPassword) || appConfig.defaultPassword,
-      sub2apiPassword: asString(body.sub2apiPassword) || appConfig.sub2apiPassword,
+      sub2apiPassword: nextSub2ApiPassword || appConfig.sub2apiPassword,
       smsBowerApiKey: asString(body.smsBowerApiKey) || appConfig.smsBowerApiKey,
     });
+    try {
+      await validateSub2ApiPasswordPatch({
+        currentPassword: appConfig.sub2apiPassword,
+        nextPassword: nextSub2ApiPassword,
+        nextUrl: merged.sub2apiUrl,
+        nextEmail: merged.sub2apiEmail,
+        authenticate: async (url, email, password) => {
+          await loginSub2ApiAdminWithCredentials(url, email, password, {force: true});
+        },
+      });
+    } catch (error) {
+      sendJson(res, 409, {error: error instanceof Error ? error.message : String(error), config: publicConfig()});
+      return;
+    }
     await saveConfig(merged);
     sendJson(res, 200, {config: publicConfig()});
     return;
@@ -5888,6 +6862,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       tasks: result.created.map(publicTask),
       skippedRunning: result.skippedRunning,
       missing: result.missing,
+      skippedReasons: result.skippedReasons,
       smsBowerMailEnabled: appConfig.smsBowerMailEnabled,
       gmailMailProvider: appConfig.gmailMailProvider,
     });
@@ -5921,6 +6896,35 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     const result = clearFailedTasks();
     await Promise.all([persistTasks(), persistEmails()]);
     sendJson(res, 200, result);
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/tasks/retry-failed") {
+    const result = retryFailedTasks();
+    await Promise.all([persistTasks(), persistEmails()]);
+    scheduleTasks();
+    sendJson(res, 201, {
+      created: result.created.map(publicTask),
+      count: result.created.length,
+      skipped: result.skipped,
+      failed: result.failed,
+    });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/tasks/fission-top-up") {
+    try {
+      const body = await readJsonBody(req);
+      const result = await createFissionTopUpTask(body);
+      await Promise.all([persistTasks(), persistEmails()]);
+      scheduleTasks();
+      sendJson(res, 201, {
+        ...result,
+        created: result.created.map(publicTask),
+      });
+    } catch (error) {
+      sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
+    }
     return;
   }
 
@@ -6026,7 +7030,7 @@ async function boot(): Promise<void> {
     .filter((item) => item && typeof item === "object" && asString(item.id) && asString(item.checkedAt))
     .slice(0, 200);
   for (const task of tasks) {
-    if (task.status === "running" || task.status === "queued") {
+    if (shouldFailTaskAfterServerRestart(task.status)) {
       task.status = "failed";
       task.error = "server restarted before task finished";
       task.finishedAt = nowIso();
@@ -6045,6 +7049,7 @@ async function boot(): Promise<void> {
     void handler(req, res);
   }).listen(appConfig.port, "0.0.0.0", () => {
     console.log(`K12 console API listening: http://127.0.0.1:${appConfig.port}/`);
+    scheduleTasks();
   });
 }
 

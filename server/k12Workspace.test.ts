@@ -1,0 +1,79 @@
+import assert from "node:assert/strict";
+import {test} from "node:test";
+
+import {
+  authWorkspaceSelectionCandidates,
+  isRecoverableWorkspaceSwitchAuthStep,
+  isRecoverableWorkspaceSelectError,
+  isSameDomainWorkspaceError,
+  mergeWorkspaceFallbackIds,
+  shouldRetryK12Invite,
+} from "./k12Workspace";
+
+test("detects same-domain workspace restriction responses", () => {
+  assert.equal(
+    isSameDomainWorkspaceError(401, '{"detail":"Only users with emails on the same domain can request access to a workspace"}'),
+    true,
+  );
+  assert.equal(isSameDomainWorkspaceError(403, "forbidden"), false);
+});
+
+test("does not retry workspace request when the workspace rejects cross-domain email", () => {
+  assert.equal(
+    shouldRetryK12Invite(1, 3, 401, '{"detail":"Only users with emails on the same domain can request access to a workspace"}'),
+    false,
+  );
+});
+
+test("noRT fallback tries task workspace first, then remaining configured workspaces", () => {
+  assert.deepEqual(
+    mergeWorkspaceFallbackIds(
+      ["631e1603-06cf-4f0b-b79b-d09fbfcfe98d"],
+      [
+        "631e1603-06cf-4f0b-b79b-d09fbfcfe98d",
+        "ff598c4d-ccaf-40c1-bfaa-cb94565764b1",
+        "83bec9de-395a-44e6-9a30-189508c22b99",
+      ],
+    ),
+    [
+      "631e1603-06cf-4f0b-b79b-d09fbfcfe98d",
+      "ff598c4d-ccaf-40c1-bfaa-cb94565764b1",
+      "83bec9de-395a-44e6-9a30-189508c22b99",
+    ],
+  );
+});
+
+test("workspace switch can recover from email verification auth step", () => {
+  assert.equal(isRecoverableWorkspaceSwitchAuthStep("https://auth.openai.com/email-verification"), true);
+  assert.equal(isRecoverableWorkspaceSwitchAuthStep("https://auth.openai.com/about-you"), true);
+  assert.equal(isRecoverableWorkspaceSwitchAuthStep("https://auth.openai.com/add-phone"), false);
+});
+
+test("auth workspace selection uses actual session workspace ids before literal fallbacks", () => {
+  assert.deepEqual(
+    authWorkspaceSelectionCandidates(
+      [{workspaces: [{id: "personal-account-id", kind: "personal"}]}],
+      ["83bec9de-395a-44e6-9a30-189508c22b99"],
+    ),
+    ["personal-account-id"],
+  );
+});
+
+test("auth workspace selection prefers configured K12 only when it is available in the auth session", () => {
+  assert.deepEqual(
+    authWorkspaceSelectionCandidates(
+      [{workspaces: [
+        {id: "personal-account-id", kind: "personal"},
+        {id: "83bec9de-395a-44e6-9a30-189508c22b99", kind: "workspace"},
+      ]}],
+      ["83bec9de-395a-44e6-9a30-189508c22b99"],
+    ),
+    ["83bec9de-395a-44e6-9a30-189508c22b99", "personal-account-id"],
+  );
+});
+
+test("no valid workspaces from workspace select is recoverable by refreshing auth session", () => {
+  assert.equal(isRecoverableWorkspaceSelectError('{"code":"no_valid_workspaces"}'), true);
+  assert.equal(isRecoverableWorkspaceSelectError("invalid_state"), true);
+  assert.equal(isRecoverableWorkspaceSelectError("invalid_workspace_selected"), false);
+});

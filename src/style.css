@@ -380,6 +380,13 @@ button.big {
     var(--surface);
 }
 
+.at-repair-card {
+  border-color: rgba(251, 191, 36, 0.35);
+  background:
+    radial-gradient(circle at top right, rgba(251, 191, 36, 0.15), transparent 48%),
+    var(--surface);
+}
+
 .smsbower-card {
   border-color: rgba(52, 211, 153, 0.35);
   background:
@@ -764,6 +771,40 @@ input[type="checkbox"] {
   cursor: pointer;
 }
 
+.task-group-row {
+  background: rgba(2, 6, 23, 0.34);
+}
+
+.task-group-row.expanded {
+  background:
+    linear-gradient(90deg, rgba(34, 211, 238, 0.15), rgba(2, 6, 23, 0.34) 18rem),
+    rgba(2, 6, 23, 0.42);
+  box-shadow: inset 4px 0 0 rgba(34, 211, 238, 0.72);
+}
+
+.task-group-row.expanded td {
+  border-bottom-color: rgba(34, 211, 238, 0.22);
+}
+
+.task-detail-row {
+  background: rgba(2, 6, 23, 0.44);
+}
+
+.task-detail-row td {
+  border-bottom-color: rgba(148, 163, 184, 0.14);
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.task-detail-row:hover {
+  background: rgba(15, 23, 42, 0.52);
+}
+
+.task-detail-row .select-col,
+.task-detail-row td:nth-child(2) {
+  background: rgba(2, 6, 23, 0.26);
+}
+
 .select-col {
   width: 42px;
   text-align: center;
@@ -786,6 +827,116 @@ input[type="checkbox"] {
 
 .cell-with-action .clipped {
   flex: 1;
+}
+
+.task-email-cell,
+.task-detail-email,
+.status-stack {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.task-detail-email {
+  position: relative;
+  padding-left: 18px;
+}
+
+.task-detail-email::before {
+  content: "";
+  position: absolute;
+  top: -12px;
+  bottom: -12px;
+  left: 4px;
+  width: 2px;
+  border-radius: 999px;
+  background: rgba(34, 211, 238, 0.26);
+}
+
+.status-stack {
+  justify-items: start;
+}
+
+.status-stack small,
+.muted {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.task-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.detail-meta {
+  padding-left: 22px;
+}
+
+.detail-node {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  flex: 0 0 24px;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid rgba(34, 211, 238, 0.38);
+  border-radius: 999px;
+  color: #a5f3fc;
+  background: rgba(8, 47, 73, 0.78);
+  font-size: 11px;
+  font-weight: 900;
+  box-shadow: 0 0 0 4px rgba(2, 6, 23, 0.72);
+}
+
+.expand-toggle {
+  width: 26px;
+  min-width: 26px;
+  padding-inline: 0;
+  text-align: center;
+}
+
+.fission-source-badge,
+.fission-progress {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(15, 23, 42, 0.56);
+  color: #dbeafe;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.fission-source-badge.sms {
+  color: #f0abfc;
+  border-color: rgba(217, 70, 239, 0.32);
+  background: rgba(112, 26, 117, 0.18);
+}
+
+.fission-source-badge.emailnator {
+  color: #bfdbfe;
+  border-color: rgba(96, 165, 250, 0.32);
+  background: rgba(30, 64, 175, 0.16);
+}
+
+.fission-source-badge.pool,
+.fission-progress {
+  color: #a7f3d0;
+  border-color: rgba(52, 211, 153, 0.3);
+  background: rgba(6, 78, 59, 0.16);
+}
+
+.fission-progress.warn {
+  color: #fecdd3;
+  border-color: rgba(251, 113, 133, 0.32);
+  background: rgba(127, 29, 29, 0.2);
 }
 
 .liveness-badge {
@@ -824,6 +975,29 @@ input[type="checkbox"] {
   gap: 8px;
   margin-top: 6px;
   flex-wrap: wrap;
+}
+
+.at-result-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.at-result-badge.ok {
+  border: 1px solid rgba(45, 212, 191, 0.42);
+  background: rgba(20, 184, 166, 0.14);
+  color: #99f6e4;
+}
+
+.at-result-badge.bad {
+  border: 1px solid rgba(251, 113, 133, 0.48);
+  background: rgba(251, 113, 133, 0.14);
+  color: #fecdd3;
 }
 
 .child-badge {
@@ -1035,6 +1209,12 @@ pre {
   color: #bbf7d0;
   border-color: rgba(52, 211, 153, 0.3);
   background: rgba(52, 211, 153, 0.12);
+}
+
+.status.partial {
+  color: #fde68a;
+  border-color: rgba(251, 191, 36, 0.36);
+  background: rgba(251, 191, 36, 0.12);
 }
 
 .status.failed,
@@ -1263,26 +1443,6 @@ tbody tr:last-child td {
 }
 
 
-.study-group-modal {
-  width: min(560px, calc(100vw - 48px));
-  max-height: min(860px, calc(100vh - 48px));
-}
-
-.study-group-body {
-  min-height: 0;
-  overflow: auto;
-  padding: 0 4px 4px;
-}
-
-.study-group-body img {
-  display: block;
-  width: min(100%, 460px);
-  max-height: calc(100vh - 180px);
-  margin: 0 auto;
-  object-fit: contain;
-  border-radius: 16px;
-  background: #fff;
-}
 .refill-history-modal {
   width: min(1280px, calc(100vw - 48px));
 }
@@ -1340,6 +1500,68 @@ tbody tr:last-child td {
   padding: 5px 8px;
   border-radius: 12px;
   font-size: 12px;
+}
+
+.pool-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.pool-search-row {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.pool-search-field {
+  display: grid;
+  gap: 4px;
+  min-width: min(360px, 100%);
+}
+
+.pool-search-field span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.pool-search-field input {
+  min-height: 34px;
+  border-radius: 8px;
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.58);
+  color: var(--muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.filter-chip strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.filter-chip.active {
+  border-color: rgba(45, 212, 191, 0.55);
+  background: rgba(20, 184, 166, 0.16);
+  color: var(--text);
+}
+
+.filter-chip:hover:not(:disabled) {
+  transform: none;
+  box-shadow: none;
 }
 
 .modal-body {
@@ -1525,6 +1747,12 @@ tbody tr:last-child td {
   gap: 12px;
 }
 
+.at-repair-history-hint {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 14px;
+}
+
 .refill-history-summary div {
   padding: 14px;
   border: 1px solid var(--line);
@@ -1664,13 +1892,5 @@ tbody tr:last-child td {
   .modal-card {
     width: calc(100vw - 20px);
     max-height: calc(100vh - 20px);
-  }
-  .study-group-modal {
-    width: calc(100vw - 20px);
-  }
-
-  .study-group-body img {
-    max-height: calc(100vh - 150px);
-    border-radius: 12px;
   }
 }
