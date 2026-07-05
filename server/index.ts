@@ -126,6 +126,10 @@ import {
   autoAtRepairProgressMessage,
   shouldPublishAutoAtRepairProgress,
 } from "./sub2ApiAutoAtRepairProgress";
+import {
+  canStartTaskInWorkerPool,
+  incrementWorkerPool,
+} from "./taskScheduler";
 
 type K12Route = "request" | "accept";
 type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
@@ -480,6 +484,7 @@ const K12_WORKSPACE_SWITCH_TOKEN_RETRIES = 6;
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
 const OPENAI_PROXY_USAGE_MAPPING_TTL_MS = 60_000;
+const AT_REPAIR_TASK_CONCURRENCY = 1;
 const sentinelSdkFile = path.join(rootDir, "sdk.js");
 
 let appConfig: AppConfig;
@@ -501,6 +506,7 @@ let workspaceCheckStatus: K12WorkspaceCheckStatus = {
   logs: [],
 };
 let activeWorkers = 0;
+let activeAtRepairWorkers = 0;
 let openAiProxyUsageMappingCache: {updatedAtMs: number; rows: OpenAiProxyUsageMappingRow[]} = {updatedAtMs: 0, rows: []};
 const manualOtpWaiters = new Map<string, {resolve: (code: string) => void; reject: (error: Error) => void; expiresAt: number}>();
 let sub2apiRefillTimer: ReturnType<typeof setInterval> | undefined;
@@ -2639,6 +2645,7 @@ async function importDataBundle(bundle: Record<string, unknown>): Promise<{email
   emails = importedEmails;
   tasks = importedTasks;
   activeWorkers = 0;
+  activeAtRepairWorkers = 0;
 
   await Promise.all([
     saveConfig(appConfig),
@@ -7917,6 +7924,8 @@ async function runTask(task: K12Task): Promise<void> {
     task.error = "邮箱记录不存在";
     task.finishedAt = nowIso();
     await persistTasks();
+    activeWorkers = Math.max(0, activeWorkers - 1);
+    scheduleTasks();
     return;
   }
   const blockedReason = exactWorkspaceBlockReason(task.email || email.email, task.workspaceIds);
@@ -7927,6 +7936,8 @@ async function runTask(task: K12Task): Promise<void> {
     task.updatedAt = nowIso();
     appendLog(task, "warn", `该邮箱当前 workspace 已标记 403 死号，任务跳过: ${blockedReason}`);
     await persistTasks();
+    activeWorkers = Math.max(0, activeWorkers - 1);
+    scheduleTasks();
     return;
   }
   task.status = "running";
@@ -8121,6 +8132,8 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     task.error = "邮箱记录不存在";
     task.finishedAt = nowIso();
     await persistTasks();
+    activeAtRepairWorkers = Math.max(0, activeAtRepairWorkers - 1);
+    scheduleTasks();
     return;
   }
   if (email.status === "banned") {
@@ -8130,6 +8143,8 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     task.updatedAt = nowIso();
     appendLog(task, "error", task.error);
     await persistTasks();
+    activeAtRepairWorkers = Math.max(0, activeAtRepairWorkers - 1);
+    scheduleTasks();
     return;
   }
   if (normalizeAtRepairTaskWorkspaceIds(task)) {
@@ -8143,6 +8158,8 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     task.updatedAt = nowIso();
     appendLog(task, "warn", `该邮箱当前 workspace 已标记 403 死号，AT 修复跳过: ${blockedReason}`);
     await persistTasks();
+    activeAtRepairWorkers = Math.max(0, activeAtRepairWorkers - 1);
+    scheduleTasks();
     return;
   }
 
@@ -8306,7 +8323,7 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     task.finishedAt = nowIso();
     task.updatedAt = nowIso();
     email.updatedAt = nowIso();
-    activeWorkers = Math.max(0, activeWorkers - 1);
+    activeAtRepairWorkers = Math.max(0, activeAtRepairWorkers - 1);
     await Promise.all([persistTasks(), persistEmails()]);
     scheduleTasks();
   }
@@ -8344,6 +8361,7 @@ function armNextTaskScheduleWakeup(nowMs = Date.now()): void {
 
 function scheduleTasks(): void {
   const limit = Math.max(1, appConfig.taskConcurrency);
+  const atRepairLimit = AT_REPAIR_TASK_CONCURRENCY;
   const nowMs = Date.now();
   for (const task of tasks) {
     if (task.status !== "queued") continue;
@@ -8378,7 +8396,7 @@ function scheduleTasks(): void {
       appendLog(task, "warn", task.error);
     }
   }
-  while (activeWorkers < limit) {
+  while (true) {
     const activeRoots = new Set(
       tasks
         .filter((item) => item.status === "running")
@@ -8390,10 +8408,23 @@ function scheduleTasks(): void {
       && taskReadyToRun(item, Date.now())
       && emails.find((email) => email.id === item.emailId)?.status !== "banned"
       && !activeRoots.has(rootMailboxIdentityByEmailId(item.emailId))
+      && canStartTaskInWorkerPool({
+        taskKind: item.kind || "k12",
+        activeMainWorkers: activeWorkers,
+        mainLimit: limit,
+        activeAtRepairWorkers,
+        atRepairLimit,
+      })
     ));
     if (!task) break;
     activeRoots.add(rootMailboxIdentityByEmailId(task.emailId));
-    activeWorkers += 1;
+    const nextWorkers = incrementWorkerPool({
+      taskKind: task.kind || "k12",
+      activeMainWorkers: activeWorkers,
+      activeAtRepairWorkers,
+    });
+    activeWorkers = nextWorkers.activeMainWorkers;
+    activeAtRepairWorkers = nextWorkers.activeAtRepairWorkers;
     void (task.kind === "at-repair" ? runAtRepairTask(task) : runTask(task));
   }
   armNextTaskScheduleWakeup();
@@ -8933,6 +8964,16 @@ function summary(): Record<string, unknown> {
       success: countByStatus(tasks, "success"),
       failed: countByStatus(tasks, "failed"),
       canceled: countByStatus(tasks, "canceled"),
+    },
+    workers: {
+      main: {
+        active: activeWorkers,
+        limit: Math.max(1, appConfig.taskConcurrency),
+      },
+      atRepair: {
+        active: activeAtRepairWorkers,
+        limit: AT_REPAIR_TASK_CONCURRENCY,
+      },
     },
     config: publicConfig(),
   };
