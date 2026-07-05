@@ -26,17 +26,25 @@ test("keeps detailed logs when a lightweight task list row has no logs", () => {
   });
 });
 
-test("uses list logs when they are present", () => {
+test("appends list logs without truncating detailed logs", () => {
   const detailed = {
     id: "task-1",
-    logs: [{at: "1", level: "info", message: "old"}],
+    logs: [
+      {at: "1", level: "info", message: "old"},
+      {at: "2", level: "info", message: "middle"},
+    ],
   };
   const listRow = {
     id: "task-1",
-    logs: [{at: "2", level: "info", message: "new"}],
+    logs: [
+      {at: "2", level: "info", message: "middle"},
+      {at: "3", level: "info", message: "new"},
+    ],
   };
 
   assert.deepEqual(mergeTaskDetailWithListTask(detailed, listRow).logs, [
-    {at: "2", level: "info", message: "new"},
+    {at: "1", level: "info", message: "old"},
+    {at: "2", level: "info", message: "middle"},
+    {at: "3", level: "info", message: "new"},
   ]);
 });

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readFileSync} from "node:fs";
 import {test} from "node:test";
 
 import {
@@ -7,6 +8,7 @@ import {
   mihonoBasicAuthHeader,
   normalizeMihonoManagerBaseUrl,
   nextOpenAiProxyPoolSelection,
+  openAiProxyPoolSelectionSequence,
   normalizeMihonoProxyPoolApiUrl,
   normalizeOpenAiProxyPool,
   parseMihonoSubscriptionLinks,
@@ -19,6 +21,10 @@ import {
   isMihonoNodeBlockedFromK12ProxyPool,
   dailyOpenAiProxyUsage,
   effectiveOpenAiProxyRetryLimit,
+  combineOpenAiProxyPoolText,
+  shouldSelectOpenAiProxyPoolForInitialAttempt,
+  describeOpenAiProxyForLog,
+  mihonoProxyTextFromMappings,
 } from "./openAiProxyPool";
 
 test("normalizes OpenAI proxy pool lines and skips comments", () => {
@@ -53,6 +59,23 @@ test("rotates OpenAI proxy pool from current proxy without leaking credentials",
     index: 1,
     total: 3,
   });
+});
+
+test("builds a proxy selection sequence after the current pool index", () => {
+  const selections = openAiProxyPoolSelectionSequence({
+    poolText: [
+      "http://user:first@example.com:17878",
+      "http://user:second@example.com:17878",
+      "http://user:third@example.com:17878",
+    ].join("\n"),
+    lastIndex: 0,
+  });
+
+  assert.deepEqual(selections.map((item) => ({proxyUrl: item.proxyUrl, index: item.index, total: item.total})), [
+    {proxyUrl: "http://user:second@example.com:17878", index: 1, total: 3},
+    {proxyUrl: "http://user:third@example.com:17878", index: 2, total: 3},
+    {proxyUrl: "http://user:first@example.com:17878", index: 0, total: 3},
+  ]);
 });
 
 test("decides whether mailbox timeout should retry with a rotated proxy", () => {
@@ -90,11 +113,46 @@ test("uses at least the available proxy pool size as retry limit", () => {
   assert.equal(effectiveOpenAiProxyRetryLimit(0, 0), 0);
 });
 
+test("selects a proxy pool node before the first OpenAI attempt when enabled", () => {
+  assert.equal(shouldSelectOpenAiProxyPoolForInitialAttempt({
+    enabled: true,
+    hasPool: true,
+    taskProxyUrl: "",
+  }), true);
+
+  assert.equal(shouldSelectOpenAiProxyPoolForInitialAttempt({
+    enabled: true,
+    hasPool: true,
+    taskProxyUrl: "http://already-selected:8080",
+  }), false);
+
+  assert.equal(shouldSelectOpenAiProxyPoolForInitialAttempt({
+    enabled: true,
+    hasPool: false,
+    taskProxyUrl: "",
+  }), false);
+
+  assert.equal(shouldSelectOpenAiProxyPoolForInitialAttempt({
+    enabled: false,
+    hasPool: true,
+    taskProxyUrl: "",
+  }), false);
+});
+
 test("treats ChatGPT callback HTTP 403 as OpenAI proxy retryable", () => {
   assert.equal(isOpenAiProxyRetryableAuthMessage("完成 ChatGPT callback 失败: HTTP 403"), true);
   assert.equal(isOpenAiProxyRetryableAuthMessage("打开 OpenAI authorize 页失败: 429"), true);
   assert.equal(isOpenAiProxyRetryableAuthMessage("workspace_id=abc HTTP 401"), false);
   assert.equal(isOpenAiProxyRetryableAuthMessage("Sub2API /api/v1/auth/login HTTP 429: Too many requests"), false);
+});
+
+test("treats OpenAI AuthorizeContinue rate limits as proxy retryable", () => {
+  assert.equal(
+    isOpenAiProxyRetryableAuthMessage(
+      'AuthorizeContinue请求失败: 429 code=rate_limit_exceeded desc=Too many requests. Please try again later. body={ "error": { "message": "Too many requests. Please try again later.", "type": "invalid_request_error", "param": null, "code": "rate_limit_exceeded" } }',
+    ),
+    true,
+  );
 });
 
 test("treats OpenAI fetch network failures as proxy retryable", () => {
@@ -209,6 +267,30 @@ test("excludes Hong Kong Mihono nodes from the K12 proxy pool", () => {
   assert.doesNotMatch(result.text, /node001|node003/);
 });
 
+test("uses the last safe Mihono proxy pool when fresh Mihono loading fails", () => {
+  assert.equal(combineOpenAiProxyPoolText({
+    mihonoText: "",
+    cachedMihonoText: "http://node002:secret@154.219.123.153:17878",
+    manualText: "http://manual:secret@10.0.0.2:8080",
+  }), [
+    "http://node002:secret@154.219.123.153:17878",
+    "http://manual:secret@10.0.0.2:8080",
+  ].join("\n"));
+
+  assert.equal(combineOpenAiProxyPoolText({
+    mihonoText: "http://fresh:secret@154.219.123.153:17878",
+    cachedMihonoText: "http://cached:secret@154.219.123.153:17878",
+    manualText: "",
+  }), "http://fresh:secret@154.219.123.153:17878");
+});
+
+test("loads fresh Mihono proxy text into the returned pool instead of shadowing it", () => {
+  const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+
+  assert.doesNotMatch(source, /let\s+mihonoText\s*=\s*text\s*;/);
+  assert.match(source, /mihonoText\s*=\s*filtered\.text\s*;/);
+});
+
 test("normalizes Mihono manager base URL and basic auth header", () => {
   assert.equal(normalizeMihonoManagerBaseUrl("127.0.0.1:17879/api/public/proxies?type=http"), "http://127.0.0.1:17879");
   assert.equal(mihonoBasicAuthHeader("admin", "pass"), "Basic YWRtaW46cGFzcw==");
@@ -276,4 +358,33 @@ test("summarizes today's proxy usage without exposing proxy passwords", () => {
   ]);
   assert.equal(JSON.stringify(usage).includes("secret"), false);
   assert.equal(JSON.stringify(usage).includes("pass"), false);
+});
+
+test("describes a proxy for task logs with Mihono node name without exposing credentials", () => {
+  const label = describeOpenAiProxyForLog("http://node001:secret@154.219.123.153:17878", [
+    {username: "node001", node: "Japan W01", endpoint: "154.219.123.153:17878"},
+  ]);
+
+  assert.equal(label, "http://***:***@154.219.123.153:17878/ (Japan W01)");
+  assert.doesNotMatch(label, /secret/);
+});
+
+test("builds a Mihono proxy pool from manager mappings when the public proxy list is unavailable", () => {
+  const text = mihonoProxyTextFromMappings(
+    [
+      {username: "node001", password: "jp-secret", node: "Japan W01"},
+      {username: "node002", password: "hk-secret", node: "Hong Kong HK01"},
+      {username: "node003", password: "bad-secret", node: "Japan W03"},
+    ],
+    "154.219.123.153",
+    17878,
+    {
+      "Japan W01": {ok: true},
+      "Japan W03": {ok: false, error: "timeout"},
+    },
+  );
+
+  assert.deepEqual(normalizeOpenAiProxyPool(text), [
+    "http://node001:jp-secret@154.219.123.153:17878",
+  ]);
 });

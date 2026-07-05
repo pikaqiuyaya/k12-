@@ -34,6 +34,10 @@ export function launchTaskTotal(motherCount: number, workspaceCount: number, wor
   return Math.max(0, Math.floor(Number(motherCount) || 0)) * workspaceLaunchMultiplier(workspaceCount, workspaceLaunchMode);
 }
 
+export function dynamicSmsLaunchTaskTotal(smsTargetCount: number): number {
+  return Math.max(0, Math.floor(Number(smsTargetCount) || 0));
+}
+
 export function summarizeLaunchSelection(input: LaunchSelectionInput): LaunchSelectionSummary {
   const selectedCount = Math.max(0, Math.floor(Number(input.selectedCount) || 0));
   const runnableMotherCount = Math.max(0, Math.floor(Number(input.runnableMotherCount) || 0));

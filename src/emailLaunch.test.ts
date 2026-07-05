@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {test} from "node:test";
 
 import {
+  dynamicSmsLaunchTaskTotal,
   isRunnableMotherEmail,
   launchTaskTotal,
   summarizeLaunchSelection,
@@ -30,6 +31,12 @@ test("counts launch tasks as one workspace per mother in random-one mode", () =>
   assert.equal(workspaceLaunchMultiplier(5, "random-one"), 1);
   assert.equal(launchTaskTotal(2, 5, "random-one"), 2);
   assert.equal(launchTaskTotal(2, 5, "all"), 10);
+});
+
+test("counts dynamic SMSBower launch by requested SMS target instead of workspace multiplier", () => {
+  assert.equal(dynamicSmsLaunchTaskTotal(7), 7);
+  assert.equal(dynamicSmsLaunchTaskTotal(0), 0);
+  assert.equal(dynamicSmsLaunchTaskTotal("7" as unknown as number), 7);
 });
 
 test("summarizes selected launch count and skipped emails", () => {

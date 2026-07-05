@@ -23,6 +23,7 @@ import {
   shouldAutoSelectEmailForK12Launch,
   normalizeWorkspaceLaunchMode,
   shouldCreatePoolFissionChild,
+  workspaceTaskVariantGroupsForLaunch,
   workspaceTaskVariantsForLaunch,
   shouldResendLoginOtpAfterWrongCode,
   shouldRequestSmsBowerNextCodeBeforeWait,
@@ -228,6 +229,26 @@ test("selects workspace task variants by launch mode", () => {
   }), [""]);
 });
 
+test("groups all workspaces into one task for dynamic SMSBower launch", () => {
+  assert.deepEqual(workspaceTaskVariantGroupsForLaunch({
+    workspaceCandidates: ["workspace-a", "workspace-b", "workspace-c"],
+    workspaceLaunchMode: "all",
+    groupAllWorkspaces: true,
+  }), [["workspace-a", "workspace-b", "workspace-c"]]);
+
+  assert.deepEqual(workspaceTaskVariantGroupsForLaunch({
+    workspaceCandidates: ["workspace-a", "workspace-b", "workspace-c"],
+    workspaceLaunchMode: "all",
+  }), [["workspace-a"], ["workspace-b"], ["workspace-c"]]);
+
+  assert.deepEqual(workspaceTaskVariantGroupsForLaunch({
+    workspaceCandidates: ["workspace-a", "workspace-b", "workspace-c"],
+    workspaceLaunchMode: "random-one",
+    randomIndex: 1,
+    groupAllWorkspaces: true,
+  }), [["workspace-b"]]);
+});
+
 test("normalizes workspace launch mode config values", () => {
   assert.equal(normalizeWorkspaceLaunchMode("random-one"), "random-one");
   assert.equal(normalizeWorkspaceLaunchMode("all"), "all");
@@ -322,9 +343,9 @@ test("does not advance SMSBower activation before the first OTP wait", () => {
   assert.equal(shouldRequestSmsBowerNextCodeBeforeWait({retryAfterWrongOtp: true}), true);
 });
 
-test("sends a fresh login OTP before waiting on a direct email-verification step", () => {
-  assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: false}), true);
-  assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: undefined}), true);
+test("does not blindly resend login OTP on a direct email-verification step", () => {
+  assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: false}), false);
+  assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: undefined}), false);
   assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: true}), false);
 });
 

@@ -19,6 +19,27 @@ export function canStartTaskInWorkerPool(input: {
   return input.activeMainWorkers < Math.max(1, input.mainLimit);
 }
 
+export function workerPoolLimits(input: {taskConcurrency: number}): {mainLimit: number; atRepairLimit: number} {
+  const limit = Math.max(1, Math.floor(input.taskConcurrency || 0));
+  return {
+    mainLimit: limit,
+    atRepairLimit: limit,
+  };
+}
+
+export function isRootActiveInWorkerPool(input: {
+  taskKind?: TaskKind | string;
+  root: string;
+  activeMainRoots: Set<string>;
+  activeAtRepairRoots: Set<string>;
+}): boolean {
+  const root = String(input.root || "").toLowerCase();
+  if (!root) return false;
+  return workerPoolForTaskKind(input.taskKind) === "at-repair"
+    ? input.activeAtRepairRoots.has(root)
+    : input.activeMainRoots.has(root);
+}
+
 export function incrementWorkerPool(input: {
   taskKind?: TaskKind | string;
   activeMainWorkers: number;

@@ -105,6 +105,20 @@ export function normalizeOpenAiProxyPool(value: unknown): string[] {
   return proxies;
 }
 
+export function combineOpenAiProxyPoolText(input: {
+  mihonoText?: string;
+  cachedMihonoText?: string;
+  manualText?: string;
+}): string {
+  return [
+    input.mihonoText || input.cachedMihonoText || "",
+    input.manualText || "",
+  ]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 export function maskProxyUrl(value: unknown): string {
   const raw = String(value || "").trim();
   if (!raw || raw.toLowerCase() === "direct") return "direct";
@@ -211,6 +225,15 @@ export function dailyOpenAiProxyUsage(
   return [...byLabel.values()].sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
+export function describeOpenAiProxyForLog(
+  proxyUrl: unknown,
+  proxyMappings: OpenAiProxyUsageMappingRow[] = [],
+): string {
+  const masked = maskProxyUrl(proxyUrl);
+  const descriptor = proxyUsageDescriptor(proxyUrl, proxyUsageMappingByUsername(proxyMappings));
+  return descriptor.node ? `${masked} (${descriptor.node})` : masked;
+}
+
 function indexOfProxy(proxies: string[], currentProxyUrl?: string): number {
   const current = String(currentProxyUrl || "").trim();
   if (!current) return -1;
@@ -219,19 +242,33 @@ function indexOfProxy(proxies: string[], currentProxyUrl?: string): number {
 }
 
 export function nextOpenAiProxyPoolSelection(input: OpenAiProxyPoolSelectionInput): OpenAiProxyPoolSelection | undefined {
+  return openAiProxyPoolSelectionSequence(input, 1)[0];
+}
+
+export function openAiProxyPoolSelectionSequence(
+  input: OpenAiProxyPoolSelectionInput,
+  maxCandidates?: number,
+): OpenAiProxyPoolSelection[] {
   const proxies = normalizeOpenAiProxyPool(input.poolText);
-  if (!proxies.length) return undefined;
+  if (!proxies.length) return [];
   const currentIndex = Number.isInteger(input.lastIndex)
     ? Number(input.lastIndex)
     : indexOfProxy(proxies, input.currentProxyUrl);
-  const index = ((currentIndex + 1) % proxies.length + proxies.length) % proxies.length;
-  const proxyUrl = proxies[index];
-  return {
-    proxyUrl,
-    maskedProxyUrl: maskProxyUrl(proxyUrl),
-    index,
-    total: proxies.length,
-  };
+  const total = proxies.length;
+  const limit = Math.max(1, Math.min(
+    Number.isFinite(maxCandidates ?? total) ? Math.trunc(maxCandidates ?? total) : total,
+    total,
+  ));
+  return Array.from({length: limit}, (_, offset) => {
+    const index = ((currentIndex + 1 + offset) % total + total) % total;
+    const proxyUrl = proxies[index];
+    return {
+      proxyUrl,
+      maskedProxyUrl: maskProxyUrl(proxyUrl),
+      index,
+      total,
+    };
+  });
 }
 
 export function shouldRetryWithOpenAiProxyAfterMailboxTimeout(input: OpenAiProxyRetryInput): boolean {
@@ -240,6 +277,16 @@ export function shouldRetryWithOpenAiProxyAfterMailboxTimeout(input: OpenAiProxy
   if (input.isSmsBowerMail) return false;
   if (!input.mailboxOtpDeliveryTimeout) return false;
   return Math.max(0, input.attempt) < Math.max(0, input.maxRetries);
+}
+
+export function shouldSelectOpenAiProxyPoolForInitialAttempt(input: {
+  enabled: boolean;
+  hasPool: boolean;
+  taskProxyUrl?: string;
+}): boolean {
+  if (!input.enabled) return false;
+  if (!input.hasPool) return false;
+  return !String(input.taskProxyUrl || "").trim();
 }
 
 export function effectiveOpenAiProxyRetryLimit(configuredMaxRetries: number, proxyCount: number): number {
@@ -300,7 +347,7 @@ export function isOpenAiProxyRetryableAuthMessage(value: unknown): boolean {
   if (networkRetryable) return true;
   if (/ChatGPT callback returned\s+access_denied|consent[ _-]?verifier[\s\S]*already[\s\S]*used/i.test(message)) return true;
   if (/workspace_id=.*HTTP\s*401|invalid_workspace_selected|no_valid_workspaces/i.test(message)) return false;
-  return /完成 ChatGPT callback 失败:\s*HTTP\s*(403|429)|打开 OpenAI authorize 页失败:\s*429|auth\.openai\.com[\s\S]*HTTP\s*429|OpenAI auth[\s\S]*HTTP\s*429/i.test(message);
+  return /完成 ChatGPT callback 失败:\s*HTTP\s*(403|429)|打开 OpenAI authorize 页失败:\s*429|AuthorizeContinue[\s\S]*(?:\b429\b|rate_limit_exceeded)|auth\.openai\.com[\s\S]*HTTP\s*429|OpenAI auth[\s\S]*HTTP\s*429/i.test(message);
 }
 
 export function normalizeMihonoProxyPoolApiUrl(value: unknown): string {
@@ -456,6 +503,29 @@ export function filterMihonoPublicProxyTextByMappings(
     originalCount: proxies.length,
     excludedCount,
   };
+}
+
+export function mihonoProxyTextFromMappings(
+  value: unknown,
+  host: string,
+  publicPort: number,
+  speedTests?: Record<string, unknown>,
+): string {
+  const mappings = Array.isArray(value) ? value : [];
+  const kept: string[] = [];
+  for (const item of mappings) {
+    const record = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    const username = String(record.username || "").trim();
+    const password = String(record.password || "").trim();
+    const node = String(record.node || "").trim();
+    if (!username || !password || !node) continue;
+    if (isMihonoNodeBlockedFromK12ProxyPool(node)) continue;
+    const speed = speedTests?.[node];
+    const speedRecord = speed && typeof speed === "object" ? speed as Record<string, unknown> : {};
+    if (speedRecord.ok === false) continue;
+    kept.push(`http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${publicPort}`);
+  }
+  return normalizeOpenAiProxyPool(kept).join("\n");
 }
 
 export function mihonoBasicAuthHeader(username: unknown, password: unknown): string {

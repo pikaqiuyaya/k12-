@@ -4,7 +4,7 @@ import {mkdir, readFile, stat, writeFile} from "node:fs/promises";
 import {createServer, type IncomingMessage, type ServerResponse} from "node:http";
 import path from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
-import {fetch as undiciFetch, ProxyAgent} from "undici";
+import {Agent, fetch as undiciFetch, ProxyAgent} from "undici";
 import {validateSub2ApiPasswordPatch} from "./configPatch";
 import {
   authWorkspaceSelectionCandidates,
@@ -46,7 +46,6 @@ import {
   shouldCreatePoolFissionChild,
   shouldResendLoginOtpAfterWrongCode,
   shouldRequestSmsBowerNextCodeBeforeWait,
-  shouldSendLoginOtpBeforeEmailVerification,
   shouldSkipDuplicateQueuedTask,
   shouldMarkPoolRootUnusableAfterUserAlreadyExists,
   smsBowerActivationBlockReason,
@@ -54,7 +53,7 @@ import {
   taskCreationSkipReason,
   taskStatusAfterCancelRequest,
   taskWorkspaceAllowed,
-  workspaceTaskVariantsForLaunch,
+  workspaceTaskVariantGroupsForLaunch,
   taskWorkspaceKey,
   taskWorkspaceKeysOverlap,
 } from "./emailFission";
@@ -99,23 +98,28 @@ import {
   type WorkspaceBlockRecord,
 } from "./workspaceBlocklist";
 import {
+  combineOpenAiProxyPoolText,
   filterMihonoMappingRowsByPublicProxies,
   filterMihonoPublicProxyTextByMappings,
   isMihonoNodeBlockedFromK12ProxyPool,
   dailyOpenAiProxyUsage,
+  describeOpenAiProxyForLog,
   effectiveOpenAiProxyRetryLimit,
   isOpenAiProxyRetryableAuthMessage,
   maskProxyUrl,
   mihonoBasicAuthHeader,
   mihonoMappingsToDisplayRows,
+  mihonoProxyTextFromMappings,
   normalizeMihonoManagerBaseUrl,
-  nextOpenAiProxyPoolSelection,
+  openAiProxyPoolSelectionSequence,
   normalizeMihonoProxyPoolApiUrl,
   normalizeOpenAiProxyPool,
   mihonoSubscriptionsToText,
   parseMihonoSubscriptionLinks,
   shouldRetryWithOpenAiProxyAfterMailboxTimeout,
+  shouldSelectOpenAiProxyPoolForInitialAttempt,
   testOpenAiProxyCandidates,
+  type OpenAiProxyPoolSelection,
   type OpenAiProxyUsageMappingRow,
 } from "./openAiProxyPool";
 import {
@@ -127,9 +131,19 @@ import {
   shouldPublishAutoAtRepairProgress,
 } from "./sub2ApiAutoAtRepairProgress";
 import {
+  openAiLoginRetryDelayMs,
+  shouldRetryOpenAiLoginNetworkError,
+} from "./openAiLoginRetry";
+import {
   canStartTaskInWorkerPool,
   incrementWorkerPool,
+  isRootActiveInWorkerPool,
+  workerPoolLimits,
 } from "./taskScheduler";
+import {extractSub2ApiListTotal, shouldFetchNextSub2ApiListPage} from "./sub2ApiPagination";
+import {buildTasksByEmailId, shouldHydrateAccessTokensFromTokenOut} from "./taskStartup";
+import {selectDefaultVisibleTasks} from "./taskListView";
+import {batchDetailView, batchSummaryView} from "./taskBatchView";
 
 type K12Route = "request" | "accept";
 type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
@@ -398,6 +412,8 @@ interface Sub2ApiRefillResult {
   deepChecked: number;
   deepOk: number;
   deepFailed: number;
+  processedAccounts?: number;
+  scannedAccounts?: number;
   pendingTasks: number;
   availableEmails: number;
   shouldRefill: boolean;
@@ -453,6 +469,7 @@ const emailsFile = path.join(dataDir, "emails.json");
 const tasksFile = path.join(dataDir, "tasks.json");
 const sub2apiRefillHistoryFile = path.join(dataDir, "sub2api-refill-history.json");
 const workspaceBlocksFile = path.join(dataDir, "workspace-blocks.json");
+const openAiProxyPoolCacheFile = path.join(dataDir, "openai-proxy-pool-cache.txt");
 const compatConfigFile = path.join(rootDir, "config.json");
 const defaultJsonOutDir = path.join(rootDir, "json");
 
@@ -484,7 +501,10 @@ const K12_WORKSPACE_SWITCH_TOKEN_RETRIES = 6;
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
 const OPENAI_PROXY_USAGE_MAPPING_TTL_MS = 60_000;
-const AT_REPAIR_TASK_CONCURRENCY = 1;
+const directMihonoDispatcher = new Agent();
+const directSmsBowerDispatcher = new Agent();
+const directSub2ApiDispatcher = new Agent();
+const directOpenAiProbeDispatcher = new Agent();
 const sentinelSdkFile = path.join(rootDir, "sdk.js");
 
 let appConfig: AppConfig;
@@ -508,6 +528,9 @@ let workspaceCheckStatus: K12WorkspaceCheckStatus = {
 let activeWorkers = 0;
 let activeAtRepairWorkers = 0;
 let openAiProxyUsageMappingCache: {updatedAtMs: number; rows: OpenAiProxyUsageMappingRow[]} = {updatedAtMs: 0, rows: []};
+let cachedMihonoProxyPoolText = "";
+let cachedMihonoProxyPoolUpdatedAt = "";
+let cachedMihonoProxyPoolLoaded = false;
 const manualOtpWaiters = new Map<string, {resolve: (code: string) => void; reject: (error: Error) => void; expiresAt: number}>();
 let sub2apiRefillTimer: ReturnType<typeof setInterval> | undefined;
 let taskScheduleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -685,6 +708,36 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
   await writeJsonAtomic(filePath, value);
 }
 
+async function loadCachedMihonoProxyPoolText(): Promise<string> {
+  if (cachedMihonoProxyPoolLoaded) return cachedMihonoProxyPoolText;
+  cachedMihonoProxyPoolLoaded = true;
+  try {
+    const text = await readFile(openAiProxyPoolCacheFile, "utf8");
+    const normalized = normalizeOpenAiProxyPool(text).join("\n");
+    if (!normalized) return "";
+    cachedMihonoProxyPoolText = normalized;
+    cachedMihonoProxyPoolUpdatedAt = (await stat(openAiProxyPoolCacheFile)).mtime.toISOString();
+  } catch {
+    cachedMihonoProxyPoolText = "";
+    cachedMihonoProxyPoolUpdatedAt = "";
+  }
+  return cachedMihonoProxyPoolText;
+}
+
+async function rememberMihonoProxyPoolText(text: string, task?: K12Task): Promise<void> {
+  const normalized = normalizeOpenAiProxyPool(text).join("\n");
+  if (!normalized) return;
+  cachedMihonoProxyPoolText = normalized;
+  cachedMihonoProxyPoolUpdatedAt = nowIso();
+  cachedMihonoProxyPoolLoaded = true;
+  try {
+    await mkdir(dataDir, {recursive: true});
+    await writeFile(openAiProxyPoolCacheFile, `${normalized}\n`, "utf8");
+  } catch (error) {
+    if (task) appendLog(task, "warn", `Mihono 代理池缓存写入失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function buildDownloadFetchOptions(): {dispatcher?: ProxyAgent} {
   const proxyUrl = appConfig?.defaultProxyUrl || process.env.DEFAULT_PROXY_URL || process.env.OPENAI_PROXY_URL || "";
   if (!proxyUrl || proxyUrl === "direct") return {};
@@ -692,7 +745,9 @@ function buildDownloadFetchOptions(): {dispatcher?: ProxyAgent} {
 }
 
 async function loadOpenAiProxyPoolText(task?: K12Task): Promise<string> {
-  const parts: string[] = [];
+  await loadCachedMihonoProxyPoolText();
+  let mihonoText = "";
+  let useCachedMihonoText = false;
   await syncMihonoSubscriptionsForProxyPool(task);
   let apiUrl = "";
   try {
@@ -708,42 +763,70 @@ async function loadOpenAiProxyPoolText(task?: K12Task): Promise<string> {
       mihonoState = stateResult.state;
       mihonoPublicHost = stateResult.publicHost;
     } catch (error) {
-      if (task) appendLog(task, "warn", `Mihono 映射读取失败，无法安全过滤香港额度 IP，本轮跳过 Mihono 代理池: ${error instanceof Error ? error.message : String(error)}`);
+      useCachedMihonoText = true;
+      if (task) appendLog(task, "warn", `Mihono 映射读取失败，无法重新过滤香港额度 IP: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10_000);
     try {
-      if (!mihonoState) return appConfig.openAiProxyPoolText || "";
-      const response = await undiciFetch(apiUrl, {
-        signal: controller.signal,
-        headers: {
-          accept: "text/plain,application/json;q=0.8,*/*;q=0.5",
-          "user-agent": "K12SpaceConsole/0.1",
-        },
-      });
-      const text = await response.text();
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${text.slice(0, 160)}`);
+      if (!mihonoState) {
+        if (task && cachedMihonoProxyPoolText) {
+          appendLog(task, "warn", `使用上次已过滤的 Mihono 代理池缓存 ${normalizeOpenAiProxyPool(cachedMihonoProxyPoolText).length} 条${cachedMihonoProxyPoolUpdatedAt ? `，更新时间 ${cachedMihonoProxyPoolUpdatedAt}` : ""}`);
+        }
+        return combineOpenAiProxyPoolText({
+          cachedMihonoText: cachedMihonoProxyPoolText,
+          manualText: appConfig.openAiProxyPoolText,
+        });
       }
-      let mihonoText = text;
       const publicPort = Number(mihonoState.public_port || 17878);
       const speedTests = mihonoState.speed_tests && typeof mihonoState.speed_tests === "object" ? mihonoState.speed_tests as Record<string, unknown> : {};
       const rows = mihonoMappingsToDisplayRows(mihonoState.mappings, mihonoPublicHost, publicPort, speedTests);
-      const filtered = filterMihonoPublicProxyTextByMappings(text, rows);
+      let publicProxyText = "";
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const response = await undiciFetch(apiUrl, {
+          signal: controller.signal,
+          dispatcher: directMihonoDispatcher,
+          headers: {
+            accept: "text/plain,application/json;q=0.8,*/*;q=0.5",
+            "user-agent": "K12SpaceConsole/0.1",
+          },
+        });
+        const text = await response.text();
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${text.slice(0, 160)}`);
+        }
+        publicProxyText = text;
+      } catch (error) {
+        publicProxyText = mihonoProxyTextFromMappings(mihonoState.mappings, mihonoPublicHost, publicPort, speedTests);
+        if (task) appendLog(task, "warn", `Mihono 公开代理列表拉取失败，已用映射直接生成代理池: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!normalizeOpenAiProxyPool(publicProxyText).length) {
+        throw new Error("Mihono 代理池为空");
+      }
+      const filtered = filterMihonoPublicProxyTextByMappings(publicProxyText, rows);
       mihonoText = filtered.text;
+      if (normalizeOpenAiProxyPool(mihonoText).length > 0) {
+        await rememberMihonoProxyPoolText(mihonoText, task);
+      }
       if (task && filtered.excludedCount > 0) {
         appendLog(task, "info", `Mihono 代理池已过滤香港额度 IP ${filtered.excludedCount} 条，可用 ${filtered.count}/${filtered.originalCount} 条`);
       }
-      parts.push(mihonoText);
     } catch (error) {
+      useCachedMihonoText = true;
       if (task) appendLog(task, "warn", `Mihono 代理池拉取失败，尝试使用手动代理池: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      clearTimeout(timer);
     }
   }
-  if (appConfig.openAiProxyPoolText) parts.push(appConfig.openAiProxyPoolText);
-  return parts.join("\n");
+  if (useCachedMihonoText && task && cachedMihonoProxyPoolText) {
+    appendLog(task, "warn", `使用上次已过滤的 Mihono 代理池缓存 ${normalizeOpenAiProxyPool(cachedMihonoProxyPoolText).length} 条${cachedMihonoProxyPoolUpdatedAt ? `，更新时间 ${cachedMihonoProxyPoolUpdatedAt}` : ""}`);
+  }
+  return combineOpenAiProxyPoolText({
+    mihonoText,
+    cachedMihonoText: useCachedMihonoText ? cachedMihonoProxyPoolText : "",
+    manualText: appConfig.openAiProxyPoolText,
+  });
 }
 
 async function syncMihonoSubscriptionsForProxyPool(task?: K12Task): Promise<void> {
@@ -769,6 +852,7 @@ async function syncMihonoSubscriptionsForProxyPool(task?: K12Task): Promise<void
   const postJson = async (pathname: string, body: Record<string, unknown>): Promise<Record<string, unknown>> => {
     const response = await undiciFetch(`${baseUrl}${pathname}`, {
       method: "POST",
+      dispatcher: directMihonoDispatcher,
       headers: {
         accept: "application/json",
         authorization: auth,
@@ -822,6 +906,7 @@ async function loadMihonoSubscriptionTextForSettings(): Promise<{text: string; c
   try {
     const response = await undiciFetch(`${baseUrl}/api/state`, {
       signal: controller.signal,
+      dispatcher: directMihonoDispatcher,
       headers: {
         accept: "application/json",
         authorization: mihonoBasicAuthHeader(appConfig.openAiProxyMihonoUsername, appConfig.openAiProxyMihonoPassword),
@@ -853,6 +938,7 @@ async function fetchMihonoManagerState(timeoutMs = 10_000): Promise<{baseUrl: st
   try {
     const response = await undiciFetch(`${baseUrl}/api/state`, {
       signal: controller.signal,
+      dispatcher: directMihonoDispatcher,
       headers: {
         accept: "application/json",
         authorization: mihonoBasicAuthHeader(appConfig.openAiProxyMihonoUsername, appConfig.openAiProxyMihonoPassword),
@@ -872,6 +958,7 @@ async function fetchMihonoManagerState(timeoutMs = 10_000): Promise<{baseUrl: st
 async function fetchMihonoPublicProxyText(): Promise<string> {
   const apiUrl = normalizeMihonoProxyPoolApiUrl(appConfig.openAiProxyPoolApiUrl);
   const response = await undiciFetch(apiUrl, {
+    dispatcher: directMihonoDispatcher,
     headers: {
       accept: "text/plain",
       "user-agent": "K12SpaceConsole/0.1",
@@ -891,6 +978,7 @@ async function loadMihonoMappingsForSettings(): Promise<{rows: ReturnType<typeof
     let filtered = {rows: allRows, totalCount: allRows.length, filteredCount: 0};
     try {
       const publicFilter = filterMihonoPublicProxyTextByMappings(await fetchMihonoPublicProxyText(), allRows);
+      await rememberMihonoProxyPoolText(publicFilter.text);
       filtered = filterMihonoMappingRowsByPublicProxies(allRows, publicFilter.text);
     } catch {
       const usableRows = allRows.filter((row) => row.ok !== false && !isMihonoNodeBlockedFromK12ProxyPool(row.node));
@@ -931,26 +1019,79 @@ async function loadOpenAiProxyUsageMappingRows(): Promise<OpenAiProxyUsageMappin
   }
 }
 
+async function openAiProxyLogLabel(proxyUrl: string): Promise<string> {
+  try {
+    return describeOpenAiProxyForLog(proxyUrl, await loadOpenAiProxyUsageMappingRows());
+  } catch {
+    return maskProxyUrl(proxyUrl);
+  }
+}
+
+async function openAiProxyRoundLogLabel(task: K12Task): Promise<string> {
+  const proxyUrl = effectiveOpenAiProxyUrl(task);
+  const label = await openAiProxyLogLabel(proxyUrl);
+  if (task.openAiProxyUrl) return label;
+  if (proxyUrl && proxyUrl.toLowerCase() !== "direct") return `${label} (默认本地代理)`;
+  return label;
+}
+
 async function testMihonoProxyPoolForSettings(): Promise<{ok: boolean; proxyCount: number; attempts: number; testedProxyMasked?: string; status?: number; error?: string}> {
   const {state, publicHost} = await fetchMihonoManagerState();
   const publicPort = Number(state.public_port || 17878);
   const speedTests = state.speed_tests && typeof state.speed_tests === "object" ? state.speed_tests as Record<string, unknown> : {};
   const rows = mihonoMappingsToDisplayRows(state.mappings, publicHost, publicPort, speedTests);
   const text = filterMihonoPublicProxyTextByMappings(await fetchMihonoPublicProxyText(), rows).text;
-  return testOpenAiProxyCandidates(text, async (proxyUrl) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8_000);
-    try {
-      const probe = await undiciFetch("https://www.gstatic.com/generate_204", {
-        dispatcher: new ProxyAgent(proxyUrl),
-        signal: controller.signal,
-        headers: {"user-agent": "K12SpaceConsole/0.1"},
-      });
-      return {ok: probe.status === 204 || probe.ok, status: probe.status};
-    } finally {
-      clearTimeout(timer);
-    }
-  }, 8);
+  await rememberMihonoProxyPoolText(text);
+  return testOpenAiProxyCandidates(text, probeOpenAiProxyForChatGpt, 8);
+}
+
+async function probeOpenAiProxyForChatGpt(proxyUrl: string): Promise<{ok: boolean; status?: number; error?: string}> {
+  const normalized = asString(proxyUrl).trim();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await undiciFetch(`${CHATGPT_BASE_URL}/api/auth/csrf`, {
+      dispatcher: normalized.toLowerCase() === "direct" ? directOpenAiProbeDispatcher : new ProxyAgent(normalized),
+      signal: controller.signal,
+      headers: {
+        accept: "application/json,text/plain;q=0.8,*/*;q=0.5",
+        "user-agent": "K12SpaceConsole/0.1",
+      },
+    });
+    const text = await response.text().catch(() => "");
+    return {
+      ok: response.ok,
+      status: response.status,
+      error: response.ok ? undefined : text.slice(0, 120),
+    };
+  } catch (error) {
+    return {ok: false, error: error instanceof Error ? error.message : String(error)};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function selectReachableOpenAiProxyPoolSelection(input: {
+  task: K12Task;
+  poolText: string;
+  currentProxyUrl?: string;
+  lastIndex?: number;
+}): Promise<OpenAiProxyPoolSelection | undefined> {
+  const candidates = openAiProxyPoolSelectionSequence({
+    poolText: input.poolText,
+    currentProxyUrl: input.currentProxyUrl,
+    lastIndex: input.lastIndex,
+  });
+  for (const candidate of candidates) {
+    const probe = await probeOpenAiProxyForChatGpt(candidate.proxyUrl);
+    if (probe.ok) return candidate;
+    const detail = probe.status ? `HTTP ${probe.status}` : (probe.error || "fetch failed");
+    appendLog(input.task, "warn", `OpenAI 代理节点不可用，跳过: ${await openAiProxyLogLabel(candidate.proxyUrl)} (${detail}) [${candidate.index + 1}/${candidate.total}]`);
+  }
+  if (candidates.length) {
+    appendLog(input.task, "warn", `OpenAI 代理池 ${candidates.length} 个节点探活都失败，本轮不切换代理`);
+  }
+  return undefined;
 }
 
 function effectiveOpenAiProxyUrl(task?: K12Task): string {
@@ -1432,7 +1573,7 @@ async function requestSmsBowerMail(action: string, params: Record<string, string
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
   try {
-    const response = await fetch(url, {signal: controller.signal});
+    const response = await undiciFetch(url, {signal: controller.signal, dispatcher: directSmsBowerDispatcher});
     const text = await response.text();
     let payload: unknown = text;
     try {
@@ -1467,7 +1608,7 @@ async function requestSmsBowerHandler(action: string, params: Record<string, str
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
   try {
-    const response = await fetch(url, {signal: controller.signal});
+    const response = await undiciFetch(url, {signal: controller.signal, dispatcher: directSmsBowerDispatcher});
     const text = await response.text();
     let payload: unknown = text;
     try {
@@ -1750,29 +1891,31 @@ function gmailAlias(rootEmail: string): string {
   return `${local}+${suffix}@${domain}`;
 }
 
+async function createSmsBowerMailRecord(): Promise<EmailRecord> {
+  const rented = await rentSmsBowerMail();
+  const root = rented.email.toLowerCase();
+  const record: EmailRecord = {
+    id: `smsbower_${Date.now()}_${randomUUID().slice(0, 8)}`,
+    email: root,
+    otpMode: "smsbower-mail",
+    password: appConfig.defaultPassword,
+    mailboxUrl: "",
+    raw: `smsbower-mail:${rented.id}:${root}`,
+    status: "free",
+    importedAt: nowIso(),
+    updatedAt: nowIso(),
+    smsBowerMailId: rented.id,
+    smsBowerMailRoot: root,
+    smsBowerMailCost: rented.cost,
+  };
+  emails.push(record);
+  return record;
+}
+
 async function createSmsBowerMailRecords(count: number): Promise<EmailRecord[]> {
   const created: EmailRecord[] = [];
-  const childrenPerRoot = appConfig.smsBowerGmailFissionEnabled ? Math.max(0, appConfig.smsBowerGmailFissionCount) : 0;
   while (created.length < count) {
-    const rented = await rentSmsBowerMail();
-    const root = rented.email.toLowerCase();
-    const record: EmailRecord = {
-      id: `smsbower_${Date.now()}_${randomUUID().slice(0, 8)}`,
-      email: root,
-      otpMode: "smsbower-mail",
-      password: appConfig.defaultPassword,
-      mailboxUrl: "",
-      raw: `smsbower-mail:${rented.id}:${root}`,
-      status: "free",
-      importedAt: nowIso(),
-      updatedAt: nowIso(),
-      smsBowerMailId: rented.id,
-      smsBowerMailRoot: root,
-      smsBowerMailCost: rented.cost,
-      smsBowerFissionChildrenRemaining: childrenPerRoot,
-    };
-    emails.push(record);
-    created.push(record);
+    created.push(await createSmsBowerMailRecord());
   }
   await persistEmails();
   return created;
@@ -2216,12 +2359,10 @@ async function enqueueNextSmsBowerFissionTask(parent: EmailRecord, task: K12Task
     parent.otpMode !== "smsbower-mail"
     || !parent.smsBowerMailId
     || task.status !== "success"
-    || (task.smsBowerFissionRemainingAfterThis || 0) <= 0
   ) {
     return undefined;
   }
   const root = findSmsBowerFissionRoot(parent);
-  const remaining = Math.max(0, task.smsBowerFissionRemainingAfterThis || 0);
   try {
     await requestSmsBowerNextMailCode(root, task, "母邮箱成功，已请求等待下一个验证码");
   } catch (error) {
@@ -2240,14 +2381,15 @@ async function enqueueNextSmsBowerFissionTask(parent: EmailRecord, task: K12Task
     runSub2Api: task.runSub2Api,
     sub2apiNoRtMode: task.sub2apiNoRtMode === true,
     sub2apiGroupName: task.sub2apiGroupName,
-    fissionRemainingAfterThis: remaining - 1,
     launchBatchId: task.launchBatchId,
     launchBatchTargetTasks: task.launchBatchTargetTasks,
+    smsBowerBatchId: task.smsBowerBatchId,
+    smsBowerBatchTargetSuccesses: task.smsBowerBatchTargetSuccesses,
   });
-  root.smsBowerFissionChildrenRemaining = remaining - 1;
+  delete root.smsBowerFissionChildrenRemaining;
   root.smsBowerFissionChildrenCreatedAt = nowIso();
   root.updatedAt = nowIso();
-  appendLog(task, "ok", `母邮箱成功，已创建裂变子任务: ${child.email}，剩余 ${remaining - 1}`);
+  appendLog(task, "ok", `母邮箱成功，已创建裂变子任务: ${child.email}，继续接码直到 SMSBower 返回上限`);
   appendLog(childTask, "info", `由母邮箱 ${parent.email} 成功后创建，复用 SMSBower activation=${parent.smsBowerMailId}`);
   await Promise.all([persistTasks(), persistEmails()]);
   return childTask;
@@ -2730,12 +2872,17 @@ async function importEmails(
   return {added, updated, skipped, invalid, inputLines: lines.length, total: emails.length, invalidSamples};
 }
 
-function hasActiveTask(emailId: string, workspaceIds?: string[]): boolean {
+function hasActiveTask(emailId: string, workspaceIds?: string[], taskKind?: TaskKind | string): boolean {
   return tasks.some((task) => (
     task.emailId === emailId
     && (task.status === "queued" || task.status === "running")
+    && (taskKind === undefined || (task.kind || "k12") === taskKind)
     && (workspaceIds === undefined || taskWorkspaceKeysOverlap(effectiveTaskWorkspaceIds(task), workspaceIds))
   ));
+}
+
+function hasActiveAtRepairTask(emailId: string, workspaceIds?: string[]): boolean {
+  return hasActiveTask(emailId, workspaceIds, "at-repair");
 }
 
 function effectiveTaskWorkspaceIds(task: Pick<K12Task, "kind" | "workspaceIds" | "sub2apiAccount">): string[] {
@@ -3018,6 +3165,9 @@ async function requeueTaskWithNextOpenAiProxyIfPossible(task: K12Task, email: Em
   const poolText = appConfig.openAiProxyPoolEnabled ? await loadOpenAiProxyPoolText(task) : "";
   const poolSize = normalizeOpenAiProxyPool(poolText).length;
   const hasPool = poolSize > 0;
+  if (appConfig.openAiProxyPoolEnabled && !hasPool) {
+    appendLog(task, "warn", "OpenAI 代理池当前为空，无法切换 IP 重试；请检查 Mihono 管理端是否可访问，或先填入手动代理池");
+  }
   const effectiveMaxRetries = effectiveOpenAiProxyRetryLimit(appConfig.openAiProxyPoolMaxRetries, poolSize);
   if (!shouldRetryWithOpenAiProxyAfterMailboxTimeout({
     enabled: appConfig.openAiProxyPoolEnabled,
@@ -3030,7 +3180,8 @@ async function requeueTaskWithNextOpenAiProxyIfPossible(task: K12Task, email: Em
     return false;
   }
 
-  const selection = nextOpenAiProxyPoolSelection({
+  const selection = await selectReachableOpenAiProxyPoolSelection({
+    task,
     poolText,
     currentProxyUrl: effectiveOpenAiProxyUrl(task),
     lastIndex: task.openAiProxyPoolIndex,
@@ -3052,9 +3203,37 @@ async function requeueTaskWithNextOpenAiProxyIfPossible(task: K12Task, email: Em
   appendLog(
     task,
     "warn",
-    `OpenAI 收码/回调疑似 IP 受限，切换代理后重试当前任务 (${task.openAiProxyRetryCount}/${effectiveMaxRetries}): ${selection.maskedProxyUrl} [${selection.index + 1}/${selection.total}]`,
+    `OpenAI 收码/回调疑似 IP 受限，切换代理后重试当前任务 (${task.openAiProxyRetryCount}/${effectiveMaxRetries}): ${await openAiProxyLogLabel(selection.proxyUrl)} [${selection.index + 1}/${selection.total}]`,
   );
   return true;
+}
+
+async function selectOpenAiProxyPoolForInitialAttempt(task: K12Task): Promise<void> {
+  if (task.openAiProxyUrl) return;
+  if (!appConfig.openAiProxyPoolEnabled) return;
+  const poolText = await loadOpenAiProxyPoolText(task);
+  const poolSize = normalizeOpenAiProxyPool(poolText).length;
+  if (!shouldSelectOpenAiProxyPoolForInitialAttempt({
+    enabled: appConfig.openAiProxyPoolEnabled,
+    hasPool: poolSize > 0,
+    taskProxyUrl: task.openAiProxyUrl,
+  })) {
+    if (!poolSize) appendLog(task, "warn", "OpenAI 代理池当前为空，首轮使用默认代理");
+    return;
+  }
+  const selection = await selectReachableOpenAiProxyPoolSelection({
+    task,
+    poolText,
+    currentProxyUrl: "",
+    lastIndex: task.openAiProxyPoolIndex,
+  });
+  if (!selection) {
+    appendLog(task, "warn", "OpenAI 代理池未选出可用节点，首轮使用默认代理");
+    return;
+  }
+  task.openAiProxyUrl = selection.proxyUrl;
+  task.openAiProxyPoolIndex = selection.index;
+  appendLog(task, "info", `OpenAI 代理池首轮选择: ${await openAiProxyLogLabel(selection.proxyUrl)} [${selection.index + 1}/${selection.total}]`);
 }
 
 function poolMailboxOtpCooldownDelayMs(root: string, workspaceIds: string[], nowMs = Date.now()): number {
@@ -3484,6 +3663,31 @@ function isAddPhoneUrl(value: string): boolean {
 function isAddPhoneFlowError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /\/add-phone|add-phone/i.test(message);
+}
+
+function isSub2ApiOAuthReauthRequiredUrl(value: string): boolean {
+  try {
+    const url = new URL(value, AUTH_BASE_URL);
+    if (url.origin !== AUTH_BASE_URL) return false;
+    return [
+      "/email-verification",
+      "/log-in",
+      "/log-in/password",
+      "/log-in-or-create-account",
+    ].some((path) => url.pathname === path || url.pathname.startsWith(`${path}/`));
+  } catch {
+    return /auth\.openai\.com\/(?:email-verification|log-in(?:\/password)?|log-in-or-create-account)/i.test(value);
+  }
+}
+
+function throwSub2ApiOAuthReauthRequired(currentUrl: string): never {
+  throw new Error(`Sub2API OAuth 需要重新邮箱验证，已阻止二次发码: ${safeUrlForLog(currentUrl)}`);
+}
+
+function isSub2ApiOAuthReauthRequiredError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("Sub2API OAuth 需要重新邮箱验证")
+    || /auth\.openai\.com\/(?:email-verification|log-in(?:\/password)?|log-in-or-create-account)/i.test(message);
 }
 
 function isInvalidPasswordError(error: unknown): boolean {
@@ -4146,6 +4350,7 @@ async function appendTokenOut(token: string): Promise<void> {
 async function hydrateTaskAccessTokensFromTokenOut(): Promise<boolean> {
   const filePath = appConfig.tokenOut;
   if (!filePath) return false;
+  if (!shouldHydrateAccessTokensFromTokenOut(tasks)) return false;
   const raw = await readFile(filePath, "utf8").catch(() => "");
   const tokens = raw
     .split(/\r?\n/)
@@ -4439,7 +4644,6 @@ async function continueAuthSteps(
     if (task) appendLog(task, level, message);
   };
   let continueUrl = startUrl;
-  let emailOtpSentInFlow = false;
 
   for (let step = 0; step < 12; step += 1) {
     log("info", `OpenAI auth step: ${continueUrl}`);
@@ -4449,7 +4653,6 @@ async function continueAuthSteps(
       try {
         continueUrl = await sendEmailOtpForLogin(client, `${AUTH_BASE_URL}/log-in/password`);
         log("ok", loginOtpSendSuccessMessage(continueUrl));
-        emailOtpSentInFlow = true;
       } catch (error) {
         throw new Error(
           `账号当前被 OpenAI 判定为密码登录步骤，已按配置尝试邮箱验证码登录，但 OpenAI 未允许发送邮箱验证码；该账号无法仅凭邮箱接码登录。原始错误：${error instanceof Error ? error.message : String(error)}`,
@@ -4473,23 +4676,11 @@ async function continueAuthSteps(
     if (continueUrl === AUTH_EMAIL_OTP_SEND_URL) {
       log("info", "OpenAI 要求发送邮箱验证码");
       continueUrl = await sendEmailOtpForSignup(client, AUTH_CREATE_ACCOUNT_PASSWORD_URL);
-      emailOtpSentInFlow = true;
       continue;
     }
 
     if (continueUrl === `${AUTH_BASE_URL}/email-verification`) {
-      if (shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: emailOtpSentInFlow})) {
-        log("info", "直接进入邮箱验证码页，本轮未触发发码，先重新请求发送登录验证码");
-        try {
-          continueUrl = await sendEmailOtpForLogin(client, `${AUTH_BASE_URL}/email-verification`);
-          log("ok", loginOtpSendSuccessMessage(continueUrl));
-        } catch (error) {
-          throw new Error(loginOtpSendFailureMessage(error));
-        }
-        emailOtpSentInFlow = true;
-        continue;
-      }
-      log("info", "等待邮箱验证码并提交");
+      log("info", "已到邮箱验证码页，直接等待当前登录验证码");
       continueUrl = await emailOtpValidateWithRetry(client, task);
       continue;
     }
@@ -4540,6 +4731,24 @@ async function loginAuthFlowWithEmailOtp(
 }
 
 async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emailAddress: string): Promise<string> {
+  const maxAttempts = 3;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await loginChatGptWebAndGetAccessTokenOnce(client, task, emailAddress);
+    } catch (error) {
+      lastError = error;
+      if (!shouldRetryOpenAiLoginNetworkError(error, attempt, maxAttempts)) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      const delayMs = openAiLoginRetryDelayMs(attempt);
+      appendLog(task, "warn", `OpenAI 登录网络失败，等待 ${Math.ceil(delayMs / 1000)} 秒后重试当前号 (${attempt}/${maxAttempts}): ${message}`);
+      await sleepForTask(task, delayMs);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function loginChatGptWebAndGetAccessTokenOnce(client: any, task: K12Task, emailAddress: string): Promise<string> {
   assertNotCanceled(task);
   appendLog(task, "info", `登录 ChatGPT Web session: ${emailAddress}`);
   await ensureChatGptCsrfCookie(client);
@@ -5603,8 +5812,9 @@ async function requestSub2ApiJson(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1000, options.timeoutMs ?? 30000));
   try {
-    const response = await fetch(`${origin}${pathname}`, {
+    const response = await undiciFetch(`${origin}${pathname}`, {
       method: options.method ?? "GET",
+      dispatcher: directSub2ApiDispatcher,
       headers: {
         Accept: options.accept || "application/json",
         "Content-Type": "application/json",
@@ -5924,7 +6134,7 @@ async function listSub2ApiAccountsPage(
   page: number,
   pageSize: number,
   groupId?: number,
-): Promise<unknown[]> {
+): Promise<{items: unknown[]; total?: number}> {
   const query = buildQueryString({
     page,
     page_size: pageSize,
@@ -5933,7 +6143,11 @@ async function listSub2ApiAccountsPage(
     group_id: groupId,
   });
   const data = await requestSub2ApiJson(origin, `/api/v1/admin/accounts?${query}`, {token: adminToken, timeoutMs: 60000});
-  return extractItems(data);
+  const items = extractItems(data);
+  return {
+    items,
+    total: extractSub2ApiListTotal(data, items.length),
+  };
 }
 
 async function listSub2ApiAccountsForGroup(
@@ -5941,17 +6155,36 @@ async function listSub2ApiAccountsForGroup(
   adminToken: string,
   group: Sub2ApiGroupSelection,
 ): Promise<{accounts: Record<string, unknown>[]; matchedAccounts: Record<string, unknown>[]}> {
-  const pageSize = 200;
-  const maxPages = 50;
+  const pageSize = 100;
+  const maxPages = 200;
   const loadPages = async (groupId?: number): Promise<Record<string, unknown>[]> => {
     const out: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    let total: number | undefined;
     for (let page = 1; page <= maxPages; page += 1) {
-      const pageItems = await listSub2ApiAccountsPage(origin, adminToken, page, pageSize, groupId);
-      const records = pageItems
+      const pageResult = await listSub2ApiAccountsPage(origin, adminToken, page, pageSize, groupId);
+      if (pageResult.total !== undefined) total = pageResult.total;
+      const records = pageResult.items
         .filter((item) => item && typeof item === "object")
         .map((item) => unwrapSub2ApiAccount(item as Record<string, unknown>));
-      out.push(...records);
-      if (pageItems.length < pageSize) break;
+      let addedUniqueCount = 0;
+      for (const record of records) {
+        const key = sub2ApiAccountId(record) || sub2ApiAccountName(record).toLowerCase();
+        if (key) {
+          if (seen.has(key)) continue;
+          seen.add(key);
+        }
+        out.push(record);
+        addedUniqueCount += 1;
+      }
+      if (!shouldFetchNextSub2ApiListPage({
+        loadedUniqueCount: out.length,
+        total,
+        lastPageItemCount: pageResult.items.length,
+        addedUniqueCount,
+        page,
+        maxPages,
+      })) break;
     }
     return out;
   };
@@ -6123,8 +6356,8 @@ async function appendSub2ApiRefillHistory(entry: Sub2ApiRefillHistoryEntry): Pro
   await persistSub2ApiRefillHistory();
 }
 
-function sub2ApiRefillStatus(): Record<string, unknown> {
-  return {
+function sub2ApiRefillStatus(options: {includeHistory?: boolean} = {}): Record<string, unknown> {
+  const status: Record<string, unknown> = {
     enabled: appConfig?.sub2apiAutoRefillEnabled === true,
     running: sub2apiRefillRunning,
     nextCheckAt: sub2apiRefillNextCheckAt,
@@ -6138,8 +6371,9 @@ function sub2ApiRefillStatus(): Record<string, unknown> {
       lastError: sub2apiAutoAtRepairLastError,
       lastResult: sub2apiAutoAtRepairLastResult,
     },
-    history: sub2apiRefillHistory.slice(0, 50),
   };
+  if (options.includeHistory) status.history = sub2apiRefillHistory.slice(0, 50);
+  return status;
 }
 
 function updateSub2ApiRefillNextCheck(): void {
@@ -6197,13 +6431,49 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
     const listed = await listSub2ApiAccountsForGroup(origin, adminToken, group);
     const localPrune = await pruneLocalSub2ApiRecordsForListedAccounts(listed, group.name);
     const basicNormalAccounts = listed.matchedAccounts.filter(sub2ApiAccountIsNormal);
+    const groupLabel = formatSub2ApiGroups([group]);
     let normalAccounts = basicNormalAccounts.length;
     let deepChecked = 0;
     let deepOk = 0;
     let deepFailed = 0;
     const samples: string[] = [];
     if (group.warning) samples.push(group.warning);
+    const pendingTasks = pendingSub2ApiRefillTaskCount(group.name);
+    const availableEmails = availableRefillEmails().length;
+    const publishProgress = () => {
+      const currentNormal = deepCheckEnabled ? deepOk : normalAccounts;
+      const progress = deepCheckEnabled && basicNormalAccounts.length ? ` ${deepChecked}/${basicNormalAccounts.length}` : "";
+      sub2apiRefillLastResult = {
+        checkedAt: sub2apiRefillLastCheckedAt,
+        source,
+        groupName: group.name,
+        groupLabel,
+        threshold,
+        refillEmailCount,
+        deepCheckEnabled,
+        totalAccounts: listed.accounts.length,
+        matchedAccounts: listed.matchedAccounts.length,
+        basicNormalAccounts: basicNormalAccounts.length,
+        normalAccounts: currentNormal,
+        deepChecked,
+        deepOk,
+        deepFailed,
+        processedAccounts: deepChecked,
+        scannedAccounts: basicNormalAccounts.length,
+        pendingTasks,
+        availableEmails,
+        shouldRefill: false,
+        createdTasks: 0,
+        skippedRunning: 0,
+        missing: 0,
+        prunedTasks: localPrune.removedTasks,
+        clearedSub2Links: localPrune.clearedEmails,
+        message: `分组 ${group.name} 补号检测中${progress}，当前正常 ${currentNormal}/${threshold}${deepCheckEnabled ? `，深度测活 ${deepOk}/${deepChecked}` : ""}`,
+        samples: [...samples],
+      };
+    };
     if (deepCheckEnabled && basicNormalAccounts.length) {
+      publishProgress();
       const deepResults = await mapWithConcurrency(
         basicNormalAccounts,
         Math.max(1, Math.min(appConfig.sub2apiConcurrency || 1, 5)),
@@ -6216,6 +6486,19 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
             : accessToken
               ? await testOpenAiAccessToken(accessToken)
               : {ok: false, status: 0, message: "Sub2API 账号缺少 id 且 credentials 缺少 access_token", latencyMs: 0};
+          deepChecked += 1;
+          if (result.ok) {
+            deepOk += 1;
+          } else {
+            deepFailed += 1;
+          }
+          if (shouldPublishAutoAtRepairProgress({
+            processedAccounts: deepChecked,
+            totalAccounts: basicNormalAccounts.length,
+            issueChanged: false,
+          })) {
+            publishProgress();
+          }
           return {accountName, result};
         },
       );
@@ -6228,8 +6511,6 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
         samples.push(`${item.accountName}: ${item.result.message}`);
       }
     }
-    const pendingTasks = pendingSub2ApiRefillTaskCount(group.name);
-    const availableEmails = availableRefillEmails().length;
     const shouldRefill = normalAccounts < threshold;
     const desiredCreate = shouldRefill ? Math.max(0, Math.min(refillEmailCount - pendingTasks, availableEmails)) : 0;
     let createdTasks = 0;
@@ -6274,7 +6555,7 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
       checkedAt: sub2apiRefillLastCheckedAt,
       source,
       groupName: group.name,
-      groupLabel: formatSub2ApiGroups([group]),
+      groupLabel,
       threshold,
       refillEmailCount,
       deepCheckEnabled,
@@ -6285,6 +6566,8 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
       deepChecked,
       deepOk,
       deepFailed,
+      processedAccounts: deepChecked,
+      scannedAccounts: basicNormalAccounts.length,
       pendingTasks,
       availableEmails,
       shouldRefill,
@@ -6496,7 +6779,7 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
         repairable: issue.repairable,
         matchedLocalEmail: true,
         emailStatus: localEmail.status,
-        hasActiveTask: hasActiveTask(localEmail.id, issueWorkspaceIds.length ? issueWorkspaceIds : undefined) || queuedRepairTargets.has(repairTargetKey),
+        hasActiveTask: hasActiveAtRepairTask(localEmail.id, issueWorkspaceIds.length ? issueWorkspaceIds : undefined) || queuedRepairTargets.has(repairTargetKey),
         message: issue.message,
       });
       if (!canCreate) {
@@ -6776,7 +7059,7 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
   };
 
   for (const email of selectedEmails) {
-    if (email.status === "running" || email.status === "banned" || hasActiveTask(email.id)) {
+    if (email.status === "banned" || hasActiveAtRepairTask(email.id)) {
       skippedRunning += 1;
       continue;
     }
@@ -7763,6 +8046,9 @@ async function followToLocalhostCallback(client: any, startUrl: string, task?: K
   let currentUrl = startUrl;
   for (let hop = 0; hop < 12; hop += 1) {
     if (currentUrl.startsWith(DEFAULT_OAUTH_REDIRECT_URI)) return currentUrl;
+    if (isSub2ApiOAuthReauthRequiredUrl(currentUrl)) {
+      throwSub2ApiOAuthReauthRequired(currentUrl);
+    }
     if (currentUrl.startsWith(CODEX_CONSENT_URL)) {
       currentUrl = await continueCodexConsent(client, currentUrl, task);
       continue;
@@ -7783,12 +8069,18 @@ async function followToLocalhostCallback(client: any, startUrl: string, task?: K
     if (location) {
       currentUrl = new URL(location, currentUrl).toString();
       if (currentUrl.startsWith(DEFAULT_OAUTH_REDIRECT_URI)) return currentUrl;
+      if (isSub2ApiOAuthReauthRequiredUrl(currentUrl)) {
+        throwSub2ApiOAuthReauthRequired(currentUrl);
+      }
       if (isAddPhoneUrl(currentUrl)) {
         throw new Error("登录后触发 add-phone 手机接码页面，按 K12 规则判定失败");
       }
       continue;
     }
     if (response.url?.startsWith(DEFAULT_OAUTH_REDIRECT_URI)) return response.url;
+    if (response.url && isSub2ApiOAuthReauthRequiredUrl(response.url)) {
+      throwSub2ApiOAuthReauthRequired(response.url);
+    }
     if (response.url?.startsWith(CODEX_CONSENT_URL)) {
       currentUrl = await continueCodexConsent(client, response.url, task);
       continue;
@@ -7865,6 +8157,9 @@ async function loginViaSub2ApiAuthorizeUrl(client: any, authorizeUrl: string, ta
   }
   let currentUrl = openResponse.url || authorizeUrl;
   if (currentUrl.startsWith(DEFAULT_OAUTH_REDIRECT_URI)) return currentUrl;
+  if (isSub2ApiOAuthReauthRequiredUrl(currentUrl)) {
+    throwSub2ApiOAuthReauthRequired(currentUrl);
+  }
   if (isAddPhoneUrl(currentUrl)) {
     throw new Error("登录后触发 add-phone 手机接码页面，按 K12 规则判定失败");
   }
@@ -7950,8 +8245,9 @@ async function runTask(task: K12Task): Promise<void> {
   await Promise.all([persistTasks(), persistEmails()]);
 
   try {
+    await selectOpenAiProxyPoolForInitialAttempt(task);
     applyOpenAiProxyEnv(task);
-    if (task.openAiProxyUrl) appendLog(task, "info", `本轮 OpenAI 代理: ${maskProxyUrl(task.openAiProxyUrl)}`);
+    appendLog(task, "info", `本轮 OpenAI 代理: ${await openAiProxyRoundLogLabel(task)}`);
     await ensureSentinelSdk();
     await waitForPoolFissionChildCooldown(task, email);
 
@@ -8033,8 +8329,13 @@ async function runTask(task: K12Task): Promise<void> {
             await appendTokenOut(accessToken);
           }
         } catch (error) {
-          if (!isAddPhoneFlowError(error)) throw error;
-          appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
+          const isOauthReauthRequired = isSub2ApiOAuthReauthRequiredError(error);
+          if (!isAddPhoneFlowError(error) && !isOauthReauthRequired) throw error;
+          if (isOauthReauthRequired) {
+            appendLog(task, "warn", "Sub2API OA 授权需要重新邮箱验证，避免二次发码，改用当前 Web AT 创建 noRT 账号");
+          } else {
+            appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
+          }
           if (!accessToken) {
             accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
             recordAccessToken(task, email, accessToken);
@@ -8046,7 +8347,7 @@ async function runTask(task: K12Task): Promise<void> {
           const accountName = await createSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
           task.sub2apiAccount = accountName;
           email.sub2apiAccount = accountName;
-          jsonSource = "gpt-k12-add-phone-fallback";
+          jsonSource = isOauthReauthRequired ? "gpt-k12-oauth-reauth-fallback" : "gpt-k12-add-phone-fallback";
         }
       }
     }
@@ -8173,8 +8474,9 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
   await Promise.all([persistTasks(), persistEmails()]);
 
   try {
+    await selectOpenAiProxyPoolForInitialAttempt(task);
     applyOpenAiProxyEnv(task);
-    if (task.openAiProxyUrl) appendLog(task, "info", `本轮 OpenAI 代理: ${maskProxyUrl(task.openAiProxyUrl)}`);
+    appendLog(task, "info", `本轮 OpenAI 代理: ${await openAiProxyRoundLogLabel(task)}`);
 
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
     const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName, task.workspaceIds);
@@ -8360,8 +8662,7 @@ function armNextTaskScheduleWakeup(nowMs = Date.now()): void {
 }
 
 function scheduleTasks(): void {
-  const limit = Math.max(1, appConfig.taskConcurrency);
-  const atRepairLimit = AT_REPAIR_TASK_CONCURRENCY;
+  const {mainLimit, atRepairLimit} = workerPoolLimits({taskConcurrency: appConfig.taskConcurrency});
   const nowMs = Date.now();
   for (const task of tasks) {
     if (task.status !== "queued") continue;
@@ -8397,9 +8698,14 @@ function scheduleTasks(): void {
     }
   }
   while (true) {
-    const activeRoots = new Set(
+    const activeMainRoots = new Set(
       tasks
-        .filter((item) => item.status === "running")
+        .filter((item) => item.status === "running" && (item.kind || "k12") !== "at-repair")
+        .map((item) => rootMailboxIdentityByEmailId(item.emailId)),
+    );
+    const activeAtRepairRoots = new Set(
+      tasks
+        .filter((item) => item.status === "running" && (item.kind || "k12") === "at-repair")
         .map((item) => rootMailboxIdentityByEmailId(item.emailId)),
     );
     const task = tasks.find((item) => (
@@ -8407,17 +8713,27 @@ function scheduleTasks(): void {
       && !item.cancelRequested
       && taskReadyToRun(item, Date.now())
       && emails.find((email) => email.id === item.emailId)?.status !== "banned"
-      && !activeRoots.has(rootMailboxIdentityByEmailId(item.emailId))
+      && !isRootActiveInWorkerPool({
+        taskKind: item.kind || "k12",
+        root: rootMailboxIdentityByEmailId(item.emailId),
+        activeMainRoots,
+        activeAtRepairRoots,
+      })
       && canStartTaskInWorkerPool({
         taskKind: item.kind || "k12",
         activeMainWorkers: activeWorkers,
-        mainLimit: limit,
+        mainLimit,
         activeAtRepairWorkers,
         atRepairLimit,
       })
     ));
     if (!task) break;
-    activeRoots.add(rootMailboxIdentityByEmailId(task.emailId));
+    const activeRoot = rootMailboxIdentityByEmailId(task.emailId);
+    if ((task.kind || "k12") === "at-repair") {
+      activeAtRepairRoots.add(activeRoot);
+    } else {
+      activeMainRoots.add(activeRoot);
+    }
     const nextWorkers = incrementWorkerPool({
       taskKind: task.kind || "k12",
       activeMainWorkers: activeWorkers,
@@ -8483,6 +8799,17 @@ function enqueueK12Task(
 }
 
 async function enqueueReplacementSmsBowerMailTask(email: EmailRecord, sourceTask: K12Task): Promise<K12Task | undefined> {
+  if (!shouldAutoReplaceSmsBowerMailFailure({
+    otpMode: email.otpMode,
+    smsBowerMailId: email.smsBowerMailId,
+    autoReplace: sourceTask.smsBowerAutoReplaceOnFailure,
+    replacementRemaining: sourceTask.smsBowerBatchId ? 1 : sourceTask.smsBowerReplacementRemaining,
+    taskStatus: sourceTask.status,
+    error: sourceTask.error,
+  })) {
+    return undefined;
+  }
+
   if (sourceTask.smsBowerBatchId) {
     const batchTasks = tasks.filter((item) => item.smsBowerBatchId === sourceTask.smsBowerBatchId);
     const successfulTasks = batchTasks.filter((item) => item.status === "success").length;
@@ -8499,17 +8826,6 @@ async function enqueueReplacementSmsBowerMailTask(email: EmailRecord, sourceTask
       appendLog(sourceTask, "info", `SMSBower 批次 ${sourceTask.smsBowerBatchId.slice(-8)} 已达到或已有足够任务在跑：成功 ${successfulTasks}/${sourceTask.smsBowerBatchTargetSuccesses || 0}，运行/排队 ${activeTasks}`);
       return undefined;
     }
-  }
-
-  if (!shouldAutoReplaceSmsBowerMailFailure({
-    otpMode: email.otpMode,
-    smsBowerMailId: email.smsBowerMailId,
-    autoReplace: sourceTask.smsBowerAutoReplaceOnFailure,
-    replacementRemaining: sourceTask.smsBowerBatchId ? 1 : sourceTask.smsBowerReplacementRemaining,
-    taskStatus: sourceTask.status,
-    error: sourceTask.error,
-  })) {
-    return undefined;
   }
 
   const remaining = sourceTask.smsBowerBatchId
@@ -8549,7 +8865,7 @@ async function enqueueReplacementSmsBowerMailTask(email: EmailRecord, sourceTask
   return task;
 }
 
-type TaskCreateSkipReason = "missing" | "smsbowerClosed" | "googleSsoUnsupported" | "running" | "banned" | "success" | "active" | "workspaceBlocked";
+type TaskCreateSkipReason = "missing" | "smsbowerClosed" | "smsbowerRentFailed" | "googleSsoUnsupported" | "running" | "banned" | "success" | "active" | "workspaceBlocked";
 
 function addTaskCreateSkipReason(reasons: Partial<Record<TaskCreateSkipReason, number>>, reason: TaskCreateSkipReason, count = 1): void {
   reasons[reason] = (reasons[reason] || 0) + count;
@@ -8570,6 +8886,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{
   const skippedReasons: Partial<Record<TaskCreateSkipReason, number>> = {};
   if (missing) addTaskCreateSkipReason(skippedReasons, "missing", missing);
   const dynamicGmailMode = !requestedEmailIds.length && appConfig.smsBowerMailEnabled;
+  const dynamicSmsBowerMode = dynamicGmailMode && appConfig.gmailMailProvider === "smsbower";
   let selectedEmails = requestedEmailIds.length
     ? emails.filter((item) => requested.has(item.id))
     : emails.filter((item) => shouldAutoSelectEmailForK12Launch({
@@ -8578,7 +8895,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{
     }));
   const defaultLimit = dynamicGmailMode ? 1 : selectedEmails.length || 1;
   const limit = asNumber(body.count, defaultLimit, 1, 500);
-  if (dynamicGmailMode) {
+  if (dynamicGmailMode && !dynamicSmsBowerMode) {
     selectedEmails = appConfig.gmailMailProvider === "emailnator"
       ? await createEmailnatorMailRecords(limit)
       : await createSmsBowerMailRecords(limit);
@@ -8592,15 +8909,22 @@ async function createTasks(body: Record<string, unknown>): Promise<{
   const workspaceLaunchMode = normalizeWorkspaceLaunchMode(body.workspaceLaunchMode);
   const created: K12Task[] = [];
   let skippedRunning = 0;
-  const smsBowerBatchId = dynamicGmailMode && appConfig.gmailMailProvider === "smsbower"
+  const smsBowerBatchId = dynamicSmsBowerMode
     ? `smsbatch_${Date.now()}_${randomUUID().slice(0, 8)}`
     : undefined;
 
-  const launchVariantCount = workspaceLaunchMode === "random-one" ? 1 : workspaceTaskVariantsForLaunch({workspaceCandidates, workspaceLaunchMode}).length;
-  const totalTaskTarget = selectedEmails.slice(0, limit).length * launchVariantCount;
+  const workspaceVariantGroupsForTarget = workspaceTaskVariantGroupsForLaunch({
+    workspaceCandidates,
+    workspaceLaunchMode,
+    groupAllWorkspaces: dynamicSmsBowerMode,
+  });
+  const launchVariantCount = workspaceVariantGroupsForTarget.length;
+  const totalTaskTarget = dynamicSmsBowerMode
+    ? limit
+    : selectedEmails.slice(0, limit).length * launchVariantCount;
   const launchBatchId = `launch_${Date.now()}_${randomUUID().slice(0, 8)}`;
 
-  for (const email of selectedEmails.slice(0, limit)) {
+  const enqueueLaunchEmail = (email: EmailRecord): void => {
     const eligibleRandomWorkspaceCandidates = workspaceLaunchMode === "random-one"
       ? workspaceCandidates.filter((workspaceId) => {
         const taskWorkspaceIds = workspaceId ? [workspaceId] : [];
@@ -8612,40 +8936,40 @@ async function createTasks(body: Record<string, unknown>): Promise<{
         });
       })
       : [];
-    const workspaceTaskVariants = workspaceLaunchMode === "random-one"
+    const workspaceTaskVariantGroups = workspaceLaunchMode === "random-one"
       ? (
         workspaceCandidates.length > 0 && eligibleRandomWorkspaceCandidates.length === 0
           ? []
-          : workspaceTaskVariantsForLaunch({
+          : workspaceTaskVariantGroupsForLaunch({
             workspaceCandidates: eligibleRandomWorkspaceCandidates,
             workspaceLaunchMode,
             randomIndex: randomInt(0, Math.max(1, eligibleRandomWorkspaceCandidates.length || 1)),
+            groupAllWorkspaces: dynamicSmsBowerMode,
           })
       )
-      : workspaceTaskVariantsForLaunch({workspaceCandidates, workspaceLaunchMode});
+      : workspaceTaskVariantGroupsForLaunch({workspaceCandidates, workspaceLaunchMode, groupAllWorkspaces: dynamicSmsBowerMode});
     const smsBowerBlockedReason = smsBowerActivationBlockReason(email);
     if (smsBowerBlockedReason) {
       email.status = "failed";
       email.lastError = smsBowerBlockedReason;
       email.updatedAt = nowIso();
-      skippedRunning += workspaceTaskVariants.length;
-      addTaskCreateSkipReason(skippedReasons, "smsbowerClosed", workspaceTaskVariants.length);
-      continue;
+      skippedRunning += workspaceTaskVariantGroups.length;
+      addTaskCreateSkipReason(skippedReasons, "smsbowerClosed", workspaceTaskVariantGroups.length);
+      return;
     }
     if (email.otpMode === "smsbower-mail" && isGoogleSsoUnsupportedMessage(email.lastError)) {
       email.status = "failed";
       email.updatedAt = nowIso();
-      skippedRunning += workspaceTaskVariants.length;
-      addTaskCreateSkipReason(skippedReasons, "googleSsoUnsupported", workspaceTaskVariants.length);
-      continue;
+      skippedRunning += workspaceTaskVariantGroups.length;
+      addTaskCreateSkipReason(skippedReasons, "googleSsoUnsupported", workspaceTaskVariantGroups.length);
+      return;
     }
-    if (!workspaceTaskVariants.length) {
+    if (!workspaceTaskVariantGroups.length) {
       skippedRunning += launchVariantCount;
       addTaskCreateSkipReason(skippedReasons, "active", launchVariantCount);
-      continue;
+      return;
     }
-    for (const workspaceId of workspaceTaskVariants) {
-      const taskWorkspaceIds = workspaceId ? [workspaceId] : [];
+    for (const taskWorkspaceIds of workspaceTaskVariantGroups) {
       const blockedReason = exactWorkspaceBlockReason(email.email, taskWorkspaceIds);
       if (blockedReason) {
         skippedRunning += 1;
@@ -8674,7 +8998,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{
           count: appConfig.smsBowerGmailFissionCount,
           isChildEmail: Boolean(email.parentEmail),
           isSmsBowerMail: email.otpMode === "smsbower-mail",
-          existingRemaining: email.smsBowerFissionChildrenRemaining,
+          existingRemaining: email.otpMode === "smsbower-mail" ? undefined : email.smsBowerFissionChildrenRemaining,
         }),
         smsBowerAutoReplaceOnFailure: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower",
         smsBowerReplacementRemaining: dynamicGmailMode && appConfig.gmailMailProvider === "smsbower"
@@ -8685,16 +9009,39 @@ async function createTasks(body: Record<string, unknown>): Promise<{
         smsBowerBatchId,
         smsBowerBatchTargetSuccesses: smsBowerBatchId ? totalTaskTarget : undefined,
       });
+      const workspaceText = taskWorkspaceIds.length ? taskWorkspaceIds.join(", ") : "";
       appendLog(
         task,
         "info",
-        `已排队: ${email.email}${workspaceId ? `，workspace=${workspaceId}` : ""}`,
+        `已排队: ${email.email}${workspaceText ? `，workspace=${workspaceText}` : ""}`,
       );
       created.push(task);
     }
+  };
+
+  if (dynamicSmsBowerMode) {
+    for (let index = 0; index < limit; index += 1) {
+      let email: EmailRecord;
+      try {
+        email = await createSmsBowerMailRecord();
+      } catch (error) {
+        const remaining = Math.max(1, limit - index);
+        skippedRunning += remaining;
+        addTaskCreateSkipReason(skippedReasons, "smsbowerRentFailed", remaining);
+        console.warn(`SMSBower 动态租号失败，停止本批剩余 ${remaining} 个: ${error instanceof Error ? error.message : String(error)}`);
+        break;
+      }
+      enqueueLaunchEmail(email);
+      await Promise.all([persistTasks(), persistEmails()]);
+      scheduleTasks();
+    }
+  } else {
+    for (const email of selectedEmails.slice(0, limit)) {
+      enqueueLaunchEmail(email);
+    }
+    void Promise.all([persistTasks(), persistEmails()]);
+    scheduleTasks();
   }
-  void Promise.all([persistTasks(), persistEmails()]);
-  scheduleTasks();
   return {created, skippedRunning, missing, skippedReasons};
 }
 
@@ -8718,7 +9065,7 @@ function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]
   let skippedNoAccount = 0;
 
   for (const email of selectedEmails) {
-    if (email.status === "banned" || hasActiveTask(email.id, repairWorkspaceIds)) {
+    if (email.status === "banned" || hasActiveAtRepairTask(email.id, repairWorkspaceIds)) {
       skippedRunning += 1;
       continue;
     }
@@ -8874,13 +9221,14 @@ function clearFailedTasks(): {removed: number} {
 function publicTask(
   task: K12Task,
   proxyUsageMappingRows: OpenAiProxyUsageMappingRow[] = [],
-  options: {includeLogs?: boolean; includeProxyUsage?: boolean} = {},
+  options: {includeLogs?: boolean; includeProxyUsage?: boolean; includeRecentLogs?: boolean} = {},
 ): Record<string, unknown> {
   const email = emails.find((item) => item.id === task.emailId);
   const rootEmail = email ? rootMailboxIdentity(email) : task.email.toLowerCase();
   const workspaceBlockReason = exactWorkspaceBlockReason(task.email || email?.email || rootEmail, task.workspaceIds);
   const includeProxyUsage = options.includeProxyUsage === true;
   const includeLogs = options.includeLogs === true;
+  const recentLogs = options.includeRecentLogs === true ? task.logs.slice(-5) : [];
   if (!includeProxyUsage && !includeLogs) {
     return {
       id: task.id,
@@ -8923,7 +9271,7 @@ function publicTask(
       smsBowerBatchId: task.smsBowerBatchId,
       smsBowerBatchTargetSuccesses: task.smsBowerBatchTargetSuccesses,
       dailyOpenAiProxyUsage: [],
-      logs: [],
+      logs: recentLogs,
     };
   }
   const relatedTasks = includeProxyUsage
@@ -8968,11 +9316,11 @@ function summary(): Record<string, unknown> {
     workers: {
       main: {
         active: activeWorkers,
-        limit: Math.max(1, appConfig.taskConcurrency),
+        limit: workerPoolLimits({taskConcurrency: appConfig.taskConcurrency}).mainLimit,
       },
       atRepair: {
         active: activeAtRepairWorkers,
-        limit: AT_REPAIR_TASK_CONCURRENCY,
+        limit: workerPoolLimits({taskConcurrency: appConfig.taskConcurrency}).atRepairLimit,
       },
     },
     config: publicConfig(),
@@ -8981,6 +9329,7 @@ function summary(): Record<string, unknown> {
 
 function reconcileEmailStatusesFromTasks(): boolean {
   let changed = restoreWorkspaceAccessDeniedEmailStatuses();
+  const tasksByEmailId = buildTasksByEmailId(tasks);
   for (const email of emails) {
     if (email.status === "banned") continue;
     if (email.otpMode === "smsbower-mail" && isGoogleSsoUnsupportedMessage(email.lastError)) {
@@ -8990,9 +9339,7 @@ function reconcileEmailStatusesFromTasks(): boolean {
         changed = true;
       }
     }
-    const related = tasks
-      .filter((task) => task.emailId === email.id)
-      .sort((a, b) => String(b.finishedAt || b.updatedAt || b.createdAt).localeCompare(String(a.finishedAt || a.updatedAt || a.createdAt)));
+    const related = tasksByEmailId.get(email.id) || [];
     const latestActive = related.find((task) => task.status === "queued" || task.status === "running");
     if (latestActive) {
       if (email.status !== "running") {
@@ -9165,7 +9512,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (method === "GET" && pathname === "/api/sub2api/refill/status") {
-    sendJson(res, 200, sub2ApiRefillStatus());
+    sendJson(res, 200, sub2ApiRefillStatus({includeHistory: true}));
     return;
   }
 
@@ -9396,9 +9743,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       tasks = pruned.tasks;
       await persistTasks();
     }
+    const visibleTasks = selectDefaultVisibleTasks(tasks, asNumber(url.searchParams.get("limit"), 600, 50, 2000));
     sendJson(res, 200, {
-      items: tasks.map((task) => publicTask(task)).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))),
+      items: visibleTasks
+        .map((task) => publicTask(task, [], {includeRecentLogs: true}))
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))),
       count: tasks.length,
+      visibleCount: visibleTasks.length,
       workspaceBlocks,
     });
     return;
@@ -9485,6 +9836,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     } catch (error) {
       sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
     }
+    return;
+  }
+
+  if (method === "GET" && pathname === "/api/tasks/batches") {
+    const items = batchSummaryView(tasks);
+    sendJson(res, 200, {items, count: items.length});
+    return;
+  }
+
+  const batchMatch = pathname.match(/^\/api\/tasks\/batches\/([^/]+)$/);
+  if (method === "GET" && batchMatch) {
+    const batchId = decodeURIComponent(batchMatch[1]);
+    const limit = asNumber(url.searchParams.get("limit"), 500, 1, 1000);
+    sendJson(res, 200, {detail: batchDetailView(tasks, batchId, limit)});
     return;
   }
 

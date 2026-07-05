@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   canStartTaskInWorkerPool,
   incrementWorkerPool,
+  isRootActiveInWorkerPool,
+  workerPoolLimits,
   workerPoolForTaskKind,
 } from "./taskScheduler";
 
@@ -37,6 +39,40 @@ test("AT repair worker limit is independent from normal task worker limit", () =
     activeAtRepairWorkers: 1,
     atRepairLimit: 1,
   }), false);
+});
+
+test("AT repair worker limit uses the configured normal task concurrency", () => {
+  assert.deepEqual(workerPoolLimits({taskConcurrency: 5}), {
+    mainLimit: 5,
+    atRepairLimit: 5,
+  });
+  assert.deepEqual(workerPoolLimits({taskConcurrency: 0}), {
+    mainLimit: 1,
+    atRepairLimit: 1,
+  });
+});
+
+test("root locks are separated between normal and AT repair worker pools", () => {
+  assert.equal(isRootActiveInWorkerPool({
+    taskKind: "at-repair",
+    root: "root@gmail.com",
+    activeMainRoots: new Set(["root@gmail.com"]),
+    activeAtRepairRoots: new Set(),
+  }), false);
+
+  assert.equal(isRootActiveInWorkerPool({
+    taskKind: "at-repair",
+    root: "root@gmail.com",
+    activeMainRoots: new Set(),
+    activeAtRepairRoots: new Set(["root@gmail.com"]),
+  }), true);
+
+  assert.equal(isRootActiveInWorkerPool({
+    taskKind: "k12",
+    root: "root@gmail.com",
+    activeMainRoots: new Set(["root@gmail.com"]),
+    activeAtRepairRoots: new Set(),
+  }), true);
 });
 
 test("increments only the selected worker pool", () => {

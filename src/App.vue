@@ -22,9 +22,9 @@
 
     <section class="overview-grid">
       <article class="stat-card glow">
-        <span>任务尝试</span>
-        <strong>{{ summary.tasks.total }}</strong>
-        <small>唯一邮箱 {{ summary.emails.total }} / 运行 {{ summary.tasks.running }} / 队列 {{ summary.tasks.queued }}</small>
+        <span>普通任务</span>
+        <strong>{{ mainTasks.length }}</strong>
+        <small>补 AT {{ atRepairTasks.length }} / 总运行 {{ summary.tasks.running }} / 队列 {{ summary.tasks.queued }}</small>
       </article>
       <article class="stat-card">
         <span>邮箱池</span>
@@ -43,13 +43,13 @@
       </article>
       <article class="stat-card refill-card">
         <span>自动补号</span>
-        <strong>{{ sub2apiRefillStatus.lastResult?.normalAccounts ?? "-" }}</strong>
+        <strong>{{ refillNormalText }}</strong>
         <small>{{ refillSummaryText }}</small>
       </article>
       <article class="stat-card at-repair-card">
         <span>自动补 AT</span>
-        <strong>{{ sub2apiRefillStatus.autoAtRepair.lastResult?.createdTasks ?? "-" }}</strong>
-        <small>{{ autoAtRepairSummaryText }}</small>
+        <strong>{{ atRepairRunningCount }}/{{ atRepairQueuedCount }}</strong>
+        <small>工作池 {{ atRepairWorkerText }} / 失败 {{ atRepairFailedCount }} / {{ autoAtRepairSummaryText }}</small>
       </article>
       <article class="stat-card smsbower-card">
         <span>SMSBower</span>
@@ -63,7 +63,7 @@
         <div>
           <p class="eyebrow">Tasks</p>
           <h2>任务列表</h2>
-          <p class="toolbar-subtitle">点击任务行打开日志弹窗。</p>
+          <p class="toolbar-subtitle">普通 K12 任务在这里；补 AT 任务单独列在下方。</p>
         </div>
         <div class="toolbar-actions task-toolbar-layout">
           <div class="toolbar-action-groups">
@@ -137,7 +137,7 @@
               <button class="ghost" @click="openEmailImport">邮箱导入</button>
               <button class="ghost" @click="openEmailPool">邮箱池</button>
               <button class="primary" :disabled="startTasksDisabled" @click="startTasks">
-                {{ busy ? "运行中" : `启动 ${launchTaskCount} 个任务` }}
+                {{ busy ? "运行中" : `启动 ${launchButtonTaskCount} 个任务` }}
               </button>
             </div>
           </div>
@@ -445,6 +445,106 @@
         </div>
       </div>
       <pre v-if="taskCheckResult" class="check-result task-check-result">{{ taskCheckResult }}</pre>
+
+      <div class="at-repair-task-section">
+        <div class="section-head compact-head at-repair-section-head">
+          <div>
+            <p class="eyebrow">AT Repair</p>
+            <h3>补 AT 任务</h3>
+            <p class="toolbar-subtitle">
+              独立工作池 {{ atRepairWorkerText }}；运行 {{ atRepairRunningCount }} / 队列 {{ atRepairQueuedCount }} / 失败 {{ atRepairFailedCount }}
+            </p>
+          </div>
+          <button class="ghost" :disabled="startingSub2apiAutoAtRepair || sub2apiRefillStatus.autoAtRepair.running" @click="startSub2apiAutoAtRepair">
+            {{ startingSub2apiAutoAtRepair || sub2apiRefillStatus.autoAtRepair.running ? "补AT自检中..." : "自检补AT" }}
+          </button>
+        </div>
+        <div class="table-wrap at-repair-task-table-wrap">
+          <table class="task-table at-repair-task-table">
+            <thead>
+              <tr>
+                <th>标识</th>
+                <th>状态</th>
+                <th>邮箱</th>
+                <th>空间</th>
+                <th>AT</th>
+                <th>Sub2API</th>
+                <th>最近日志</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="task in sortedAtRepairTasks"
+                :key="task.id"
+                :class="['task-row', 'at-repair-task-row', { active: selectedTask?.id === task.id }]"
+                @click="openTaskLog(task)"
+              >
+                <td>
+                  <span class="task-kind-badge at-repair">补 AT</span>
+                </td>
+                <td>
+                  <div class="status-stack">
+                    <span :class="['status', task.status]">{{ statusText(task.status) }}</span>
+                    <small>{{ fmtTime(task.startedAt || task.createdAt || "") }}</small>
+                  </div>
+                </td>
+                <td>
+                  <div class="task-email-cell">
+                    <div class="cell-with-action">
+                      <span class="mono clipped">{{ task.email }}</span>
+                      <button class="ghost tiny" @click.stop="copyText(task.email, '邮箱已复制')">复制</button>
+                    </div>
+                    <div class="task-meta-row">
+                      <small class="muted">{{ task.parentEmail ? `母号：${task.parentEmail}` : "母号/账号" }}</small>
+                    </div>
+                  </div>
+                </td>
+                <td class="mono clipped">{{ workspaceIdsLabel(task.workspaceIds) }}</td>
+                <td>
+                  <div class="cell-with-action">
+                    <span class="mono clipped">{{ task.accessTokenPreview || "pending" }}</span>
+                    <span v-if="task.accessTokenLiveness" :class="['liveness-badge', task.accessTokenLiveness]" :title="task.accessTokenLivenessMessage || ''">
+                      {{ livenessText(task.accessTokenLiveness) }}
+                    </span>
+                  </div>
+                </td>
+                <td class="mono clipped">{{ task.sub2apiAccount || "-" }}</td>
+                <td class="at-repair-log-cell">{{ latestTaskLogMessage(task) }}</td>
+                <td>
+                  <div class="row-actions">
+                    <button class="ghost small" @click.stop="openTaskLog(task)">日志</button>
+                    <button
+                      v-if="task.status === 'queued' || task.status === 'running'"
+                      class="danger small"
+                      @click.stop="cancelTask(task.id)"
+                    >
+                      取消
+                    </button>
+                    <button
+                      v-if="canDeleteTask(task)"
+                      class="ghost small"
+                      @click.stop="retryTask(task.id)"
+                    >
+                      重试
+                    </button>
+                    <button
+                      v-if="canDeleteTask(task)"
+                      class="danger small"
+                      @click.stop="deleteTask(task.id)"
+                    >
+                      删除
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              <tr v-if="!sortedAtRepairTasks.length">
+                <td colspan="8" class="empty">暂无补 AT 任务；点击“自检补AT”后会在这里单独显示。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <div v-if="toast" class="toast">{{ toast }}</div>
@@ -710,8 +810,8 @@
             <section class="settings-section">
               <div class="section-head compact-head">
                 <div>
-                  <p class="eyebrow">SMSBower Gmail</p>
-                  <h3>动态谷歌邮箱接码</h3>
+                  <p class="eyebrow">Gmail</p>
+                  <h3>接码与裂变</h3>
                 </div>
                 <span class="pill">{{ form.smsBowerMailEnabled ? "已启用" : "未启用" }}</span>
               </div>
@@ -749,13 +849,19 @@
               <p v-if="smsBowerBackendUnsupported" class="inline-alert warn">
                 当前后端未返回 SMSBower 配置字段，说明服务仍在跑旧进程。请重启后端后再保存，否则开关会被旧接口丢弃。
               </p>
-              <label v-if="form.gmailMailProvider === 'smsbower'" class="switch-card refill-switch">
+              <label class="switch-card refill-switch">
                 <input v-model="form.smsBowerGmailFissionEnabled" type="checkbox" />
                 <span>
-                  <strong>开启谷歌裂变</strong>
-                  <small>母邮箱任务成功后，再逐个创建 +alias 子邮箱任务，避免验证码串号。</small>
+                  <strong>开启邮箱池裂变</strong>
+                  <small>不需要开启 SMSBower；导入的 Gmail 母号成功后，会继续创建 +alias 子邮箱任务。</small>
                 </span>
               </label>
+              <div class="config-grid refill-config-grid">
+                <label class="field">
+                  <span>每个母邮箱裂变子任务数</span>
+                  <input v-model.number="form.smsBowerGmailFissionCount" type="number" min="1" max="100" />
+                </label>
+              </div>
               <div v-if="form.gmailMailProvider === 'smsbower'" class="config-grid refill-config-grid">
                 <label class="field">
                   <span class="field-title-row">
@@ -784,10 +890,6 @@
                 <label class="field">
                   <span>最高价格（可空）</span>
                   <input v-model="form.smsBowerMailMaxPrice" placeholder="留空不限制" />
-                </label>
-                <label class="field">
-                  <span>每个母邮箱裂变子任务数</span>
-                  <input v-model.number="form.smsBowerGmailFissionCount" type="number" min="1" max="100" />
                 </label>
               </div>
             </section>
@@ -906,7 +1008,7 @@
                           <div class="batch-detail-head">
                             <strong>批次 {{ item.id }}</strong>
                             <span>
-                              明细 {{ batchDetails(item.id).rows.length }}/{{ batchDetails(item.id).total }}
+                              {{ isBatchDetailLoading(item.id) ? "明细加载中..." : `明细 ${batchDetails(item.id).rows.length}/${batchDetails(item.id).total}` }}
                               <template v-if="batchDetails(item.id).limited">，仅展示前 500 条</template>
                             </span>
                           </div>
@@ -927,6 +1029,12 @@
                                 <td class="mono">{{ row.workspace }}</td>
                                 <td>{{ row.k12 }}</td>
                                 <td class="batch-error">{{ row.error || "-" }}</td>
+                              </tr>
+                              <tr v-if="isBatchDetailLoading(item.id)">
+                                <td colspan="5" class="empty">正在加载批次明细...</td>
+                              </tr>
+                              <tr v-else-if="!batchDetails(item.id).rows.length">
+                                <td colspan="5" class="empty">暂无批次明细。</td>
                               </tr>
                             </tbody>
                           </table>
@@ -1365,6 +1473,7 @@ import {
   mergeK12RepairScanResults,
 } from "./emailPoolRepairFilter";
 import {
+  dynamicSmsLaunchTaskTotal,
   isRunnableMotherEmail,
   launchTaskTotal,
   summarizeLaunchSelection,
@@ -1385,9 +1494,10 @@ import {taskTreeToneClass, taskWorkspaceToneClass} from "./taskTreeTone";
 import {workspaceStateFromRootGroup, workspaceStateFromStatus, workspaceStateFromTask} from "./workspaceDisplayState";
 import {atRepairRecentStatusText, refillHistoryOutcome, refillRecentStatusText} from "./refillHistoryView";
 import {refillHistoryDetailLines, refillHistoryPreviewText} from "./refillHistoryDetails";
-import {launchBatchDetailRows, type LaunchBatchDetailRows} from "./launchBatchDetails";
-import {summarizeLaunchBatches} from "./launchBatchSummary";
+import {type LaunchBatchDetailRows} from "./launchBatchDetails";
+import {type LaunchBatchSummary} from "./launchBatchSummary";
 import {mergeTaskDetailWithListTask} from "./taskDetailMerge";
+import {splitTasksByKind} from "./taskKind";
 import {dedupeWorkspaceIds, parseWorkspaceIds} from "./workspaceIds";
 
 interface EmailItem {
@@ -1503,6 +1613,7 @@ interface Sub2ApiRefillResult {
   deepChecked?: number;
   deepOk?: number;
   deepFailed?: number;
+  processedAccounts?: number;
   pendingTasks: number;
   availableEmails: number;
   createdTasks: number;
@@ -1567,6 +1678,10 @@ interface SmsBowerAccountStatus {
 const defaultSummary = {
   emails: {total: 0, free: 0, running: 0, success: 0, failed: 0, banned: 0},
   tasks: {total: 0, queued: 0, running: 0, success: 0, failed: 0, canceled: 0},
+  workers: {
+    main: {active: 0, limit: 0},
+    atRepair: {active: 0, limit: 0},
+  },
 };
 
 const summary = reactive(JSON.parse(JSON.stringify(defaultSummary)));
@@ -1590,6 +1705,9 @@ const sub2apiRefillHistory = ref<Sub2ApiRefillResult[]>([]);
 const refillHistoryFilter = ref<RefillHistoryFilter>("all");
 const expandedRefillHistoryIds = ref<string[]>([]);
 const expandedBatchIds = ref<string[]>([]);
+const launchBatchSummaries = ref<LaunchBatchSummary[]>([]);
+const launchBatchDetailById = ref<Record<string, LaunchBatchDetailRows>>({});
+const launchBatchDetailLoadingById = ref<Record<string, boolean>>({});
 const emails = ref<EmailItem[]>([]);
 const tasks = ref<TaskItem[]>([]);
 const workspaceBlocks = ref<WorkspaceBlockItem[]>([]);
@@ -1719,9 +1837,15 @@ const activeTaskCount = computed(() => summary.tasks.running + summary.tasks.que
 const workspaceCount = computed(() => currentWorkspaceIds().length);
 const launchMotherCount = computed(() => {
   const count = Math.max(1, Number(runCount.value) || 1);
-  return form.smsBowerMailEnabled ? count : Math.min(count, emails.value.filter(isRunnableMotherEmail).length);
+  const runnablePoolCount = emails.value.length
+    ? emails.value.filter(isRunnableMotherEmail).length
+    : summary.emails.free;
+  return form.smsBowerMailEnabled ? count : Math.min(count, runnablePoolCount);
 });
 const launchTaskCount = computed(() => launchTaskTotal(launchMotherCount.value, workspaceCount.value, workspaceLaunchMode.value));
+const launchButtonTaskCount = computed(() => form.smsBowerMailEnabled && form.gmailMailProvider === "smsbower"
+  ? dynamicSmsLaunchTaskTotal(runCount.value)
+  : launchTaskCount.value);
 const startTasksDisabled = computed(() => busy.value || (!form.smsBowerMailEnabled && launchTaskCount.value <= 0));
 const filteredEmails = computed(() => emails.value.filter((item) => matchesEmailPoolFilter(item, emailPoolFilter.value) && matchesEmailPoolSearch(item)));
 const atRepairNeededEmails = computed(() => emails.value.filter((item) => isK12RepairNeededResult(emailAtCheckResults.value[item.id]) && canRepairEmail(item)));
@@ -1772,18 +1896,33 @@ const selectedLaunchButtonTitle = computed(() => {
 const selectedRepairableEmailIds = computed(() => emails.value
   .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
   .map((item) => item.id));
-const checkableTasks = computed(() => tasks.value.filter((item) => canCheckTaskAt(item)));
+const checkableTasks = computed(() => mainTasks.value.filter((item) => canCheckTaskAt(item)));
 const selectedCheckableTaskIds = computed(() => checkableTasks.value
   .filter((item) => selectedTaskIds.value.includes(item.id))
   .map((item) => item.id));
 const allCheckableTasksSelected = computed(() => checkableTasks.value.length > 0 && checkableTasks.value.every((item) => selectedTaskIds.value.includes(item.id)));
 const inactiveMarkedTasks = computed(() => tasks.value.filter((item) => item.accessTokenLiveness === "inactive" || item.accessTokenLiveness === "banned"));
+const taskKindGroups = computed(() => splitTasksByKind(tasks.value));
+const mainTasks = computed(() => taskKindGroups.value.mainTasks);
+const atRepairTasks = computed(() => taskKindGroups.value.atRepairTasks);
+const taskStatusRank = (status: string) => status === "running" ? 0 : status === "queued" ? 1 : 2;
 const sortedTasks = computed(() => {
   const rank = (status: string) => status === "running" ? 0 : status === "queued" ? 1 : 2;
-  return visibleTasksForWorkspaceIds(tasks.value, currentWorkspaceIds())
+  return visibleTasksForWorkspaceIds(mainTasks.value, currentWorkspaceIds())
     .map((task, index) => ({task, index}))
     .sort((a, b) => rank(a.task.status) - rank(b.task.status) || a.index - b.index)
     .map((item) => item.task);
+});
+const sortedAtRepairTasks = computed(() => atRepairTasks.value
+  .map((task, index) => ({task, index}))
+  .sort((a, b) => taskStatusRank(a.task.status) - taskStatusRank(b.task.status) || String(b.task.createdAt || "").localeCompare(String(a.task.createdAt || "")) || a.index - b.index)
+  .map((item) => item.task));
+const atRepairRunningCount = computed(() => atRepairTasks.value.filter((task) => task.status === "running").length);
+const atRepairQueuedCount = computed(() => atRepairTasks.value.filter((task) => task.status === "queued").length);
+const atRepairFailedCount = computed(() => atRepairTasks.value.filter((task) => task.status === "failed").length);
+const atRepairWorkerText = computed(() => {
+  const worker = summary.workers?.atRepair || {active: 0, limit: 0};
+  return `${worker.active}/${worker.limit || form.taskConcurrency || 0}`;
 });
 const taskGroups = computed(() => buildTaskGroups(sortedTasks.value, {minimumTargetChildren: form.smsBowerGmailFissionCount}));
 const taskRootGroups = computed(() => buildTaskRootGroups(sortedTasks.value, {minimumTargetChildren: form.smsBowerGmailFissionCount}));
@@ -1815,9 +1954,24 @@ const childEmails = computed(() => emails.value.filter((item) => Boolean(item.pa
 const bannedChildEmails = computed(() => childEmails.value.filter((item) => item.status === "banned"));
 const freeChildEmails = computed(() => emails.value.filter((item) => Boolean(item.parentEmail) && item.status === "free"));
 const allVisibleEmailsSelected = computed(() => deletableEmails.value.length > 0 && deletableEmails.value.every((item) => selectedEmailIds.value.includes(item.id)));
+const refillProgressText = computed(() => {
+  const result = sub2apiRefillStatus.lastResult;
+  const processed = Number(result?.processedAccounts ?? 0);
+  const total = Number(result?.scannedAccounts ?? 0);
+  if (!sub2apiRefillStatus.running || !Number.isFinite(total) || total <= 0) return "";
+  return `${Math.min(Math.max(0, processed), total)}/${total}`;
+});
+const refillNormalText = computed(() => {
+  if (sub2apiRefillStatus.running && refillProgressText.value) return refillProgressText.value;
+  return sub2apiRefillStatus.lastResult?.normalAccounts ?? "-";
+});
 const refillSummaryText = computed(() => {
   const result = sub2apiRefillStatus.lastResult;
-  if (sub2apiRefillStatus.running) return "检测中";
+  if (sub2apiRefillStatus.running) {
+    const progress = refillProgressText.value;
+    if (progress) return `检测中 ${progress} / 正常 ${result?.deepOk ?? result?.normalAccounts ?? 0}`;
+    return "检测中";
+  }
   if (sub2apiRefillStatus.lastError) return `错误：${sub2apiRefillStatus.lastError}`;
   if (!result) return sub2apiRefillStatus.enabled ? "等待首次检测" : "未启用";
   return `${result.groupName} / 预警 ${result.threshold} / 已补 ${result.createdTasks}`;
@@ -1873,24 +2027,31 @@ function refillHistoryPreview(item: Sub2ApiRefillResult) {
   return refillHistoryPreviewText(item);
 }
 const activeBatchSummaries = computed(() => {
-  return summarizeLaunchBatches(tasks.value);
+  return launchBatchSummaries.value;
 });
 function isBatchExpanded(batchId: string) {
   return expandedBatchIds.value.includes(batchId);
 }
-function toggleBatchRow(batchId: string) {
-  expandedBatchIds.value = expandedBatchIds.value.includes(batchId)
-    ? expandedBatchIds.value.filter((item) => item !== batchId)
-    : [...expandedBatchIds.value, batchId];
+async function toggleBatchRow(batchId: string) {
+  if (expandedBatchIds.value.includes(batchId)) {
+    expandedBatchIds.value = expandedBatchIds.value.filter((item) => item !== batchId);
+    return;
+  }
+  expandedBatchIds.value = [...expandedBatchIds.value, batchId];
+  await loadLaunchBatchDetail(batchId);
 }
 function batchDetails(batchId: string): LaunchBatchDetailRows {
-  return launchBatchDetailRows(tasks.value, batchId, 500);
+  return launchBatchDetailById.value[batchId] || {total: 0, limited: false, rows: []};
+}
+function isBatchDetailLoading(batchId: string) {
+  return Boolean(launchBatchDetailLoadingById.value[batchId]);
 }
 function setRefillHistoryFilter(value: string) {
   if (["all", "refill", "at-repair", "delete-403", "workspace-delete", "batch"].includes(value)) {
     refillHistoryFilter.value = value as RefillHistoryFilter;
     expandedRefillHistoryIds.value = [];
     expandedBatchIds.value = [];
+    if (value === "batch") void loadLaunchBatches();
   }
 }
 const emailImportPlaceholder = computed(() => emailImportMode.value === "manual"
@@ -1989,6 +2150,7 @@ function formatTaskCreateSkipReasons(data: any): string {
   const labels: Record<string, string> = {
     missing: "不存在",
     smsbowerClosed: "SMSBower接码已关闭",
+    smsbowerRentFailed: "SMSBower租号失败",
     googleSsoUnsupported: "Google登录不支持",
     running: "运行中",
     banned: "封号",
@@ -2064,6 +2226,8 @@ async function loadSummary() {
   const data = await api<any>("/api/summary");
   Object.assign(summary.emails, data.emails || defaultSummary.emails);
   Object.assign(summary.tasks, data.tasks || defaultSummary.tasks);
+  Object.assign(summary.workers.main, data.workers?.main || defaultSummary.workers.main);
+  Object.assign(summary.workers.atRepair, data.workers?.atRepair || defaultSummary.workers.atRepair);
   applySub2apiRefillStatus(data.sub2apiRefill || {});
   if (Array.isArray(data.sub2apiRefill?.history)) {
     sub2apiRefillHistory.value = data.sub2apiRefill.history;
@@ -2292,9 +2456,38 @@ async function loadSub2apiRefillHistory() {
   sub2apiRefillHistory.value = data.items || [];
 }
 
+async function loadLaunchBatches() {
+  const data = await api<any>("/api/tasks/batches");
+  launchBatchSummaries.value = data.items || [];
+}
+
+async function loadLaunchBatchDetail(batchId: string, options: {force?: boolean} = {}) {
+  if (!batchId) return;
+  if (!options.force && launchBatchDetailById.value[batchId]) return;
+  if (launchBatchDetailLoadingById.value[batchId]) return;
+  launchBatchDetailLoadingById.value = {...launchBatchDetailLoadingById.value, [batchId]: true};
+  try {
+    const data = await api<any>(`/api/tasks/batches/${encodeURIComponent(batchId)}?limit=500`);
+    launchBatchDetailById.value = {
+      ...launchBatchDetailById.value,
+      [batchId]: data.detail || {total: 0, limited: false, rows: []},
+    };
+  } finally {
+    const next = {...launchBatchDetailLoadingById.value};
+    delete next[batchId];
+    launchBatchDetailLoadingById.value = next;
+  }
+}
+
+async function refreshLaunchBatchViewIfOpen() {
+  if (!showSub2apiRefillHistoryModal.value || refillHistoryFilter.value !== "batch") return;
+  await loadLaunchBatches();
+  await Promise.all(expandedBatchIds.value.map((batchId) => loadLaunchBatchDetail(batchId, {force: true})));
+}
+
 async function openSub2apiRefillHistory() {
   showSub2apiRefillHistoryModal.value = true;
-  await Promise.all([loadSummary(), loadSub2apiRefillHistory()]);
+  await Promise.all([loadSummary(), loadSub2apiRefillHistory(), loadLaunchBatches()]);
 }
 
 function closeSub2apiRefillHistory() {
@@ -2314,12 +2507,16 @@ async function loadTasks() {
     if (listTask) selectedTask.value = mergeTaskDetailWithListTask(selectedTask.value, listTask);
     if (showTaskLogModal.value) void refreshSelectedTaskDetail(selectedTask.value.id);
   } else if (tasks.value.length) {
-    selectedTask.value = sortedTasks.value[0];
+    selectedTask.value = sortedTasks.value[0] || sortedAtRepairTasks.value[0] || null;
   }
 }
 
 async function refreshAll() {
   await Promise.all([loadSummary(), loadEmails(), loadTasks()]);
+}
+
+async function refreshLive() {
+  await Promise.all([loadSummary(), loadTasks(), refreshLaunchBatchViewIfOpen()]);
 }
 
 async function refreshSmsBowerAccountQuietly() {
@@ -2846,6 +3043,18 @@ function workspaceLabel(group: TaskTableGroup) {
   return `${workspaceId.slice(0, 8)}...`;
 }
 
+function workspaceIdsLabel(workspaceIds?: string[]) {
+  const ids = (workspaceIds || []).filter(Boolean);
+  if (!ids.length) return "-";
+  return ids.map((id) => `${id.slice(0, 8)}...`).join(", ");
+}
+
+function latestTaskLogMessage(task: TaskItem) {
+  const latest = (task.logs || []).at(-1)?.message || task.error || "";
+  if (!latest) return "-";
+  return latest.length > 90 ? `${latest.slice(0, 90)}...` : latest;
+}
+
 function normalizeKey(value: unknown) {
   return String(value || "").trim().toLowerCase();
 }
@@ -3333,8 +3542,8 @@ function formatMoney(value: unknown) {
 
 onMounted(async () => {
   await loadConfig();
-  await Promise.all([refreshAll(), refreshSmsBowerAccountQuietly()]);
-  timer = window.setInterval(refreshAll, 2500);
+  await Promise.all([refreshLive(), refreshSmsBowerAccountQuietly()]);
+  timer = window.setInterval(refreshLive, 2500);
   smsBowerAccountTimer = window.setInterval(refreshSmsBowerAccountQuietly, 60000);
 });
 

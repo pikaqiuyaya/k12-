@@ -1,6 +1,8 @@
 import {createHash} from "node:crypto";
+import {Agent, fetch as undiciFetch} from "undici";
 
 const CODE_PATTERN = /\b\d{6}\b/;
+const directMailboxDispatcher = new Agent();
 
 export interface MailboxSnapshot {
     hash: string;
@@ -14,12 +16,14 @@ export interface MailboxWaitOptions {
     intervalMs?: number;
     allowBaselineCodeAfterMs?: number;
     fetchTimeoutMs?: number;
+    fetchImpl?: typeof fetch;
     progressIntervalMs?: number;
     onProgress?: (event: MailboxWaitProgress) => void;
 }
 
 export interface MailboxFetchOptions {
     fetchTimeoutMs?: number;
+    fetchImpl?: typeof fetch;
 }
 
 export interface MailboxWaitProgress {
@@ -254,10 +258,14 @@ export class MailboxUrlCodeProvider {
     async fetchRaw(options: MailboxFetchOptions = {}): Promise<string> {
         const fetchTimeoutMs = Math.max(1, Math.floor(options.fetchTimeoutMs ?? 10000));
         const controller = new AbortController();
+        const fetchImpl = options.fetchImpl ?? ((input, init) => undiciFetch(input, {
+            ...init,
+            dispatcher: directMailboxDispatcher,
+        }) as Promise<Response>);
         let timeout: ReturnType<typeof setTimeout> | undefined;
         let response: Response;
         try {
-            const request = fetch(this.mailboxUrl, {
+            const request = fetchImpl(this.mailboxUrl, {
                 method: "GET",
                 headers: {
                     Accept: "application/json,text/plain,*/*",
@@ -310,7 +318,7 @@ export class MailboxUrlCodeProvider {
         while (Date.now() - startedAt < timeoutMs) {
             attempt += 1;
             try {
-                const snapshot = await this.snapshot({fetchTimeoutMs});
+                const snapshot = await this.snapshot({fetchTimeoutMs, fetchImpl: options.fetchImpl});
                 if (snapshot.code) {
                     const isBaseline = sameAsBaseline(snapshot, options.baseline);
                     if (!isBaseline) {

@@ -103,6 +103,19 @@ export function workspaceTaskVariantsForLaunch(input: {
   return [variants[index]];
 }
 
+export function workspaceTaskVariantGroupsForLaunch(input: {
+  workspaceCandidates: string[];
+  workspaceLaunchMode?: WorkspaceLaunchMode;
+  randomIndex?: number;
+  groupAllWorkspaces?: boolean;
+}): string[][] {
+  const variants = workspaceTaskVariantsForLaunch(input);
+  if (!input.groupAllWorkspaces || input.workspaceLaunchMode === "random-one") {
+    return variants.map((workspaceId) => workspaceId ? [workspaceId] : []);
+  }
+  return [variants.filter(Boolean)];
+}
+
 export function taskWorkspaceKey(workspaceIds: string[] | undefined): string {
   const [first] = (workspaceIds || []).map((item) => String(item || "").trim()).filter(Boolean);
   return first ? first.toLowerCase() : "__no_workspace__";
@@ -270,7 +283,7 @@ export function shouldRequestSmsBowerNextCodeBeforeWait(input: {retryAfterWrongO
 }
 
 export function shouldSendLoginOtpBeforeEmailVerification(input: {otpSentInFlow?: boolean}): boolean {
-  return input.otpSentInFlow !== true;
+  return false;
 }
 
 export function loginOtpSendSuccessMessage(nextUrl: string): string {
