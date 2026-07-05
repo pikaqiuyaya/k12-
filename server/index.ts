@@ -122,6 +122,10 @@ import {
   normalizeSub2ApiGroupName,
   normalizeSub2ApiGroupText,
 } from "./sub2ApiGroupNames";
+import {
+  autoAtRepairProgressMessage,
+  shouldPublishAutoAtRepairProgress,
+} from "./sub2ApiAutoAtRepairProgress";
 
 type K12Route = "request" | "accept";
 type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
@@ -6381,6 +6385,46 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
     let skippedRunning = 0;
     let skippedUnmatched = 0;
     let skippedTerminal = 0;
+    let processedAccounts = 0;
+    const groupLabel = formatSub2ApiGroups([group]);
+    const publishProgress = () => {
+      sub2apiAutoAtRepairLastResult = {
+        checkedAt: sub2apiAutoAtRepairLastCheckedAt,
+        source,
+        groupName: group.name,
+        groupLabel,
+        scannedAccounts: listed.matchedAccounts.length,
+        issueAccounts,
+        matchedEmails,
+        createdTasks,
+        skippedRunning,
+        skippedUnmatched,
+        skippedTerminal,
+        prunedTasks: localPrune.removedTasks,
+        clearedSub2Links: localPrune.clearedEmails,
+        message: autoAtRepairProgressMessage({
+          processedAccounts,
+          totalAccounts: listed.matchedAccounts.length,
+          issueAccounts,
+          createdTasks,
+          skippedRunning,
+          skippedUnmatched,
+          skippedTerminal,
+        }),
+        samples: [...samples],
+      };
+    };
+    const finishAccount = (issueChanged = false) => {
+      processedAccounts += 1;
+      if (shouldPublishAutoAtRepairProgress({
+        processedAccounts,
+        totalAccounts: listed.matchedAccounts.length,
+        issueChanged,
+      })) {
+        publishProgress();
+      }
+    };
+    publishProgress();
 
     for (const account of listed.matchedAccounts) {
       const accountName = sub2ApiAccountName(account) || "(unnamed)";
@@ -6394,8 +6438,14 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
           issue = sub2ApiK12LivenessIssue({planMismatch, liveness});
         }
       }
-      if (!issue) continue;
-      if (!isAutoAtRepairIssue(issue.issue)) continue;
+      if (!issue) {
+        finishAccount();
+        continue;
+      }
+      if (!isAutoAtRepairIssue(issue.issue)) {
+        finishAccount();
+        continue;
+      }
       const localEmail = findLocalEmailForSub2ApiAccount(account);
       if (!issue.repairable) {
         skippedTerminal += 1;
@@ -6417,12 +6467,14 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
           skippedUnmatched += 1;
           if (samples.length < 10) samples.push(`${accountName}: ${issue.message}，403 工作区拒绝访问，但未能确定本地邮箱或 workspace`);
         }
+        finishAccount(true);
         continue;
       }
       issueAccounts += 1;
       if (!localEmail) {
         skippedUnmatched += 1;
         if (samples.length < 10) samples.push(`${accountName}: ${issue.message}，未匹配到本地邮箱`);
+        finishAccount(true);
         continue;
       }
       matchedEmails += 1;
@@ -6443,6 +6495,7 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
       if (!canCreate) {
         skippedRunning += 1;
         if (samples.length < 10) samples.push(`${localEmail.email}: ${issue.message}，已有任务或邮箱不可用`);
+        finishAccount(true);
         continue;
       }
       const created = createAtRepairTasks({
@@ -6461,6 +6514,7 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
         skippedRunning += created.skippedRunning || 1;
         if (samples.length < 10) samples.push(`${localEmail.email}: ${issue.message}，未创建修复任务`);
       }
+      finishAccount(true);
     }
 
     const skippedRunningSuffix = skippedRunning ? `，跳过已有任务/邮箱不可用 ${skippedRunning} 个` : "";
@@ -6476,7 +6530,7 @@ async function runSub2ApiAutoAtRepair(source: "manual" | "timer"): Promise<Sub2A
       checkedAt: sub2apiAutoAtRepairLastCheckedAt,
       source,
       groupName: group.name,
-      groupLabel: formatSub2ApiGroups([group]),
+      groupLabel,
       scannedAccounts: listed.matchedAccounts.length,
       issueAccounts,
       matchedEmails,
