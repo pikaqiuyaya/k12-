@@ -8,17 +8,38 @@ import {
   hasSmsBowerFissionHistory,
   isSmsBowerCodeLimitReachedMessage,
   isSmsBowerNoCodeTimeoutMessage,
+  isMailboxAccountInvalidMessage,
+  isMailboxOtpDeliveryTimeoutMessage,
+  isOpenAiUserAlreadyExistsMessage,
+  isMailboxBaselineCodeTimeoutMessage,
   isWrongEmailOtpCodeMessage,
+  loginOtpSendFailureMessage,
+  loginOtpSendSuccessMessage,
   mailboxOtpWaitOptions,
   poolFissionRemainingForNextTask,
   poolFissionRemainingForNewTask,
   shouldEnqueueSmsBowerBatchReplacement,
   shouldAutoReplaceSmsBowerMailFailure,
+  shouldAutoSelectEmailForK12Launch,
+  normalizeWorkspaceLaunchMode,
   shouldCreatePoolFissionChild,
+  workspaceTaskVariantsForLaunch,
+  shouldResendLoginOtpAfterWrongCode,
   shouldRequestSmsBowerNextCodeBeforeWait,
+  shouldSendLoginOtpBeforeEmailVerification,
+  shouldCancelActiveTaskStatus,
   shouldSkipDuplicateQueuedTask,
+  shouldCooldownPoolFissionAfterMailboxOtpTimeout,
+  shouldStopPoolFissionAfterMailboxOtpTimeout,
+  shouldStopPoolFissionAfterUserAlreadyExists,
+  shouldTreatPoolChildUserAlreadyExistsAsLimitSuccess,
+  shouldMarkPoolRootUnusableAfterUserAlreadyExists,
   smsBowerActivationBlockReason,
   taskCreationSkipReason,
+  taskStatusAfterCancelRequest,
+  taskWorkspaceAllowed,
+  taskWorkspaceKey,
+  taskWorkspaceKeysOverlap,
 } from "./emailFission";
 
 test("enables automatic pool fission for ordinary root Gmail tasks", () => {
@@ -100,6 +121,33 @@ test("ordinary pool fission only consumes remaining quota on success", () => {
   assert.equal(poolFissionRemainingForNextTask({status: "canceled", remaining: 3}), 3);
 });
 
+test("cooldowns ordinary pool fission after mailbox OTP delivery timeouts without marking it terminal", () => {
+  assert.equal(isMailboxOtpDeliveryTimeoutMessage("mailbox code timeout: mailbox still returns baseline code"), true);
+  assert.equal(isMailboxOtpDeliveryTimeoutMessage("mailbox code timeout: mailbox returned no code"), true);
+  assert.equal(isMailboxOtpDeliveryTimeoutMessage("mailbox code timeout: mailbox_url request timeout after 10000ms"), true);
+  assert.equal(isMailboxOtpDeliveryTimeoutMessage("mailbox dead: The email account is invalid"), false);
+  assert.equal(shouldCooldownPoolFissionAfterMailboxOtpTimeout({
+    isSmsBowerMail: false,
+    isChildEmail: true,
+    mailboxOtpDeliveryTimeout: true,
+  }), true);
+  assert.equal(shouldStopPoolFissionAfterMailboxOtpTimeout({
+    isSmsBowerMail: false,
+    isChildEmail: true,
+    mailboxOtpDeliveryTimeout: true,
+  }), false);
+  assert.equal(shouldCooldownPoolFissionAfterMailboxOtpTimeout({
+    isSmsBowerMail: false,
+    isChildEmail: false,
+    mailboxOtpDeliveryTimeout: true,
+  }), false);
+  assert.equal(shouldCooldownPoolFissionAfterMailboxOtpTimeout({
+    isSmsBowerMail: true,
+    isChildEmail: true,
+    mailboxOtpDeliveryTimeout: true,
+  }), false);
+});
+
 test("top-up fission only creates the missing chain length", () => {
   assert.equal(fissionTopUpDeficit({targetSuccesses: 5, successfulChildren: 4, activeTasks: 0}), 1);
   assert.equal(fissionTopUpRemainingAfterThis(1), 0);
@@ -109,9 +157,9 @@ test("top-up fission only creates the missing chain length", () => {
   assert.equal(fissionTopUpDeficit({targetSuccesses: 5, successfulChildren: 4, activeTasks: 1}), 0);
 });
 
-test("top-up fission is blocked for dynamic mailbox providers", () => {
-  assert.equal(fissionTopUpBlockReason({otpMode: "smsbower-mail"}), "SMSBower Gmail 不参与继续补分裂");
-  assert.equal(fissionTopUpBlockReason({otpMode: "auto", hasSmsBowerHistory: true}), "SMSBower Gmail 不参与继续补分裂");
+test("top-up fission is allowed for reusable SMSBower activations and blocked for Emailnator", () => {
+  assert.equal(fissionTopUpBlockReason({otpMode: "smsbower-mail"}), undefined);
+  assert.equal(fissionTopUpBlockReason({otpMode: "auto", hasSmsBowerHistory: true}), undefined);
   assert.equal(fissionTopUpBlockReason({otpMode: "emailnator"}), "Emailnator 动态邮箱暂不支持继续补分裂");
   assert.equal(fissionTopUpBlockReason({otpMode: "auto"}), undefined);
   assert.equal(fissionTopUpBlockReason({otpMode: "manual"}), undefined);
@@ -136,10 +184,55 @@ test("detects SMSBower fission history from related task email records", () => {
 
 test("skips K12 task creation for emails that should not be queued again", () => {
   assert.equal(taskCreationSkipReason({emailStatus: "free", hasActiveTask: false}), undefined);
-  assert.equal(taskCreationSkipReason({emailStatus: "running", hasActiveTask: false}), "running");
-  assert.equal(taskCreationSkipReason({emailStatus: "banned", hasActiveTask: false}), "banned");
-  assert.equal(taskCreationSkipReason({emailStatus: "success", hasActiveTask: false}), "success");
+  assert.equal(taskCreationSkipReason({emailStatus: "running", hasActiveTask: false}), undefined);
+  assert.equal(taskCreationSkipReason({emailStatus: "banned", hasActiveTask: false}), undefined);
+  assert.equal(taskCreationSkipReason({emailStatus: "success", hasActiveTask: false}), undefined);
   assert.equal(taskCreationSkipReason({emailStatus: "free", hasActiveTask: true}), "active");
+  assert.equal(taskCreationSkipReason({emailStatus: "free", hasActiveTask: false, hasPriorSuccess: true}), "success");
+});
+
+test("auto-selects reusable mother emails for launching new workspace tasks", () => {
+  assert.equal(shouldAutoSelectEmailForK12Launch({emailStatus: "success", isChildEmail: false}), true);
+  assert.equal(shouldAutoSelectEmailForK12Launch({emailStatus: "failed", isChildEmail: false}), true);
+  assert.equal(shouldAutoSelectEmailForK12Launch({emailStatus: "free", isChildEmail: false}), true);
+  assert.equal(shouldAutoSelectEmailForK12Launch({emailStatus: "running", isChildEmail: false}), false);
+  assert.equal(shouldAutoSelectEmailForK12Launch({emailStatus: "banned", isChildEmail: false}), true);
+  assert.equal(shouldAutoSelectEmailForK12Launch({emailStatus: "success", isChildEmail: true}), false);
+});
+
+test("matches K12 task uniqueness by workspace id", () => {
+  assert.equal(taskWorkspaceKey(["83bec9de-395a-44e6-9a30-189508c22b99"]), "83bec9de-395a-44e6-9a30-189508c22b99");
+  assert.equal(taskWorkspaceKey([]), "__no_workspace__");
+  assert.equal(taskWorkspaceKeysOverlap(["workspace-a"], ["workspace-a"]), true);
+  assert.equal(taskWorkspaceKeysOverlap(["workspace-a"], ["workspace-b"]), false);
+  assert.equal(taskWorkspaceKeysOverlap([], []), true);
+});
+
+test("selects workspace task variants by launch mode", () => {
+  assert.deepEqual(workspaceTaskVariantsForLaunch({
+    workspaceCandidates: ["workspace-a", "workspace-b", "workspace-c"],
+    workspaceLaunchMode: "all",
+    randomIndex: 2,
+  }), ["workspace-a", "workspace-b", "workspace-c"]);
+
+  assert.deepEqual(workspaceTaskVariantsForLaunch({
+    workspaceCandidates: ["workspace-a", "workspace-b", "workspace-c"],
+    workspaceLaunchMode: "random-one",
+    randomIndex: 1,
+  }), ["workspace-b"]);
+
+  assert.deepEqual(workspaceTaskVariantsForLaunch({
+    workspaceCandidates: [],
+    workspaceLaunchMode: "random-one",
+    randomIndex: 1,
+  }), [""]);
+});
+
+test("normalizes workspace launch mode config values", () => {
+  assert.equal(normalizeWorkspaceLaunchMode("random-one"), "random-one");
+  assert.equal(normalizeWorkspaceLaunchMode("all"), "all");
+  assert.equal(normalizeWorkspaceLaunchMode("bad"), "all");
+  assert.equal(normalizeWorkspaceLaunchMode(undefined), "all");
 });
 
 test("skips only duplicate queued K12 tasks after a prior success exists", () => {
@@ -229,17 +322,58 @@ test("does not advance SMSBower activation before the first OTP wait", () => {
   assert.equal(shouldRequestSmsBowerNextCodeBeforeWait({retryAfterWrongOtp: true}), true);
 });
 
+test("sends a fresh login OTP before waiting on a direct email-verification step", () => {
+  assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: false}), true);
+  assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: undefined}), true);
+  assert.equal(shouldSendLoginOtpBeforeEmailVerification({otpSentInFlow: true}), false);
+});
+
+test("reports whether the login OTP send request succeeded before waiting", () => {
+  assert.equal(
+    loginOtpSendSuccessMessage("https://auth.openai.com/email-verification"),
+    "登录验证码发送请求成功，继续等待邮箱新验证码",
+  );
+  assert.equal(
+    loginOtpSendSuccessMessage("https://auth.openai.com/workspace"),
+    "登录验证码发送请求成功，下一步: https://auth.openai.com/workspace",
+  );
+  assert.equal(
+    loginOtpSendFailureMessage(new Error("HTTP 429")),
+    "登录验证码发送请求失败，停止等待验证码: HTTP 429",
+  );
+});
+
+test("resends login OTP after wrong-code retry for every login OTP mode", () => {
+  assert.equal(shouldResendLoginOtpAfterWrongCode({otpMode: "auto"}), true);
+  assert.equal(shouldResendLoginOtpAfterWrongCode({otpMode: undefined}), true);
+  assert.equal(shouldResendLoginOtpAfterWrongCode({otpMode: "manual"}), true);
+  assert.equal(shouldResendLoginOtpAfterWrongCode({otpMode: "smsbower-mail"}), true);
+  assert.equal(shouldResendLoginOtpAfterWrongCode({otpMode: "emailnator"}), true);
+});
+
 test("detects OpenAI email OTP validation errors for same-activation retry", () => {
   assert.equal(isWrongEmailOtpCodeMessage("EmailOtpValidate请求失败: 401 code=wrong_email_otp_code"), true);
   assert.equal(isWrongEmailOtpCodeMessage("K12 workspace HTTP 401"), false);
 });
 
-test("disables mailbox baseline fallback after OpenAI rejects an email OTP", () => {
-  assert.deepEqual(mailboxOtpWaitOptions({retryAfterWrongOtp: true}), {
+test("never uses mailbox baseline codes as OTP fallback", () => {
+  assert.deepEqual(mailboxOtpWaitOptions({retryAfterWrongOtp: false}), {
     timeoutMs: 120000,
     intervalMs: 3000,
     allowBaselineCodeAfterMs: 0,
   });
+
+  assert.deepEqual(mailboxOtpWaitOptions({retryAfterWrongOtp: true}), {
+    timeoutMs: 45000,
+    intervalMs: 3000,
+    allowBaselineCodeAfterMs: 0,
+  });
+});
+
+test("detects mailbox baseline-code timeouts after wrong OTP retry", () => {
+  assert.equal(isMailboxBaselineCodeTimeoutMessage("mailbox code timeout: mailbox still returns baseline code"), true);
+  assert.equal(isMailboxBaselineCodeTimeoutMessage("mailbox code timeout: mailbox returned no code"), false);
+  assert.equal(isMailboxBaselineCodeTimeoutMessage("mailbox dead: The email account is invalid"), false);
 });
 
 test("detects SMSBower per-activation code limit responses", () => {
@@ -250,6 +384,111 @@ test("detects SMSBower per-activation code limit responses", () => {
 test("detects SMSBower no-code timeout responses for replacement", () => {
   assert.equal(isSmsBowerNoCodeTimeoutMessage("SMSBower 邮箱中未找到验证码: a@gmail.com; last=SMSBower getCode 失败: Code has not been received yet"), true);
   assert.equal(isSmsBowerNoCodeTimeoutMessage("K12 workspace HTTP 401"), false);
+});
+
+test("detects terminal mailbox account invalid errors", () => {
+  assert.equal(isMailboxAccountInvalidMessage("mailbox dead: The email account is invalid"), true);
+  assert.equal(isMailboxAccountInvalidMessage("The email account is invalid"), true);
+  assert.equal(isMailboxAccountInvalidMessage("mailbox code timeout: mailbox returned no code"), false);
+  assert.equal(isMailboxAccountInvalidMessage("邮箱基线读取失败: network timeout"), false);
+});
+
+test("marks queued and running tasks canceled immediately on cancel request", () => {
+  assert.equal(taskStatusAfterCancelRequest("queued"), "canceled");
+  assert.equal(taskStatusAfterCancelRequest("running"), "canceled");
+  assert.equal(taskStatusAfterCancelRequest("failed"), "failed");
+  assert.equal(taskStatusAfterCancelRequest("success"), "success");
+});
+
+test("only queued and running tasks are active-stop candidates", () => {
+  assert.equal(shouldCancelActiveTaskStatus("queued"), true);
+  assert.equal(shouldCancelActiveTaskStatus("running"), true);
+  assert.equal(shouldCancelActiveTaskStatus("failed"), false);
+  assert.equal(shouldCancelActiveTaskStatus("success"), false);
+  assert.equal(shouldCancelActiveTaskStatus("canceled"), false);
+});
+
+test("detects tasks outside the current workspace config", () => {
+  assert.equal(taskWorkspaceAllowed(["83bec9de-395a-44e6-9a30-189508c22b99"], ["ff598c4d-ccaf-40c1-bfaa-cb94565764b1"]), false);
+  assert.equal(taskWorkspaceAllowed(["ff598c4d-ccaf-40c1-bfaa-cb94565764b1"], ["ff598c4d-ccaf-40c1-bfaa-cb94565764b1"]), true);
+  assert.equal(taskWorkspaceAllowed([], ["ff598c4d-ccaf-40c1-bfaa-cb94565764b1"]), true);
+  assert.equal(taskWorkspaceAllowed(["83bec9de-395a-44e6-9a30-189508c22b99"], []), true);
+});
+
+test("detects OpenAI user-already-exists responses for alias-family fission stop", () => {
+  assert.equal(isOpenAiUserAlreadyExistsMessage("CreateAccount 请求失败: HTTP 400 {\"error\":{\"code\":\"user_already_exists\"}}"), true);
+  assert.equal(isOpenAiUserAlreadyExistsMessage("An account already exists for this email address, please login instead."), true);
+  assert.equal(isOpenAiUserAlreadyExistsMessage("K12 workspace HTTP 401"), false);
+});
+
+test("does not stop ordinary email-pool fission after user-already-exists because it can succeed after cooldown", () => {
+  assert.equal(shouldStopPoolFissionAfterUserAlreadyExists({
+    isSmsBowerMail: false,
+    userAlreadyExists: true,
+    successfulChildren: 4,
+    accountExistsFailures: 1,
+  }), false);
+
+  assert.equal(shouldStopPoolFissionAfterUserAlreadyExists({
+    isSmsBowerMail: false,
+    userAlreadyExists: false,
+    successfulChildren: 4,
+    accountExistsFailures: 1,
+  }), false);
+
+  assert.equal(shouldStopPoolFissionAfterUserAlreadyExists({
+    isSmsBowerMail: false,
+    userAlreadyExists: true,
+    successfulChildren: 0,
+    accountExistsFailures: 1,
+  }), false);
+
+  assert.equal(shouldStopPoolFissionAfterUserAlreadyExists({
+    isSmsBowerMail: true,
+    userAlreadyExists: true,
+    successfulChildren: 4,
+    accountExistsFailures: 1,
+  }), false);
+});
+
+test("keeps ordinary pool child user-already-exists as retryable failure instead of limit success", () => {
+  assert.equal(shouldTreatPoolChildUserAlreadyExistsAsLimitSuccess({
+    isSmsBowerMail: false,
+    isChildEmail: true,
+    userAlreadyExists: true,
+  }), false);
+
+  assert.equal(shouldTreatPoolChildUserAlreadyExistsAsLimitSuccess({
+    isSmsBowerMail: false,
+    isChildEmail: false,
+    userAlreadyExists: true,
+  }), false);
+
+  assert.equal(shouldTreatPoolChildUserAlreadyExistsAsLimitSuccess({
+    isSmsBowerMail: true,
+    isChildEmail: true,
+    userAlreadyExists: true,
+  }), false);
+});
+
+test("marks only ordinary root mailbox registration collisions as unusable", () => {
+  assert.equal(shouldMarkPoolRootUnusableAfterUserAlreadyExists({
+    isSmsBowerMail: false,
+    isChildEmail: false,
+    userAlreadyExists: true,
+  }), true);
+
+  assert.equal(shouldMarkPoolRootUnusableAfterUserAlreadyExists({
+    isSmsBowerMail: false,
+    isChildEmail: true,
+    userAlreadyExists: true,
+  }), false);
+
+  assert.equal(shouldMarkPoolRootUnusableAfterUserAlreadyExists({
+    isSmsBowerMail: true,
+    isChildEmail: false,
+    userAlreadyExists: true,
+  }), false);
 });
 
 test("continues SMSBower dynamic batch until target successes are reached", () => {

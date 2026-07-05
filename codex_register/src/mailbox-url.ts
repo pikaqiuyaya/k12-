@@ -13,6 +13,19 @@ export interface MailboxWaitOptions {
     timeoutMs?: number;
     intervalMs?: number;
     allowBaselineCodeAfterMs?: number;
+    fetchTimeoutMs?: number;
+    progressIntervalMs?: number;
+    onProgress?: (event: MailboxWaitProgress) => void;
+}
+
+export interface MailboxFetchOptions {
+    fetchTimeoutMs?: number;
+}
+
+export interface MailboxWaitProgress {
+    attempt: number;
+    elapsedMs: number;
+    lastError: string;
 }
 
 function asString(value: unknown): string {
@@ -238,13 +251,36 @@ export class MailboxUrlCodeProvider {
         }
     }
 
-    async fetchRaw(): Promise<string> {
-        const response = await fetch(this.mailboxUrl, {
-            method: "GET",
-            headers: {
-                Accept: "application/json,text/plain,*/*",
-            },
-        });
+    async fetchRaw(options: MailboxFetchOptions = {}): Promise<string> {
+        const fetchTimeoutMs = Math.max(1, Math.floor(options.fetchTimeoutMs ?? 10000));
+        const controller = new AbortController();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        let response: Response;
+        try {
+            const request = fetch(this.mailboxUrl, {
+                method: "GET",
+                headers: {
+                    Accept: "application/json,text/plain,*/*",
+                },
+                signal: controller.signal,
+            });
+            response = await Promise.race([
+                request,
+                new Promise<Response>((_, reject) => {
+                    timeout = setTimeout(() => {
+                        controller.abort();
+                        reject(new Error(`mailbox_url request timeout after ${fetchTimeoutMs}ms`));
+                    }, fetchTimeoutMs);
+                }),
+            ]);
+        } catch (error) {
+            if (controller.signal.aborted) {
+                throw new Error(`mailbox_url request timeout after ${fetchTimeoutMs}ms`);
+            }
+            throw error;
+        } finally {
+            if (timeout) clearTimeout(timeout);
+        }
         const raw = await response.text();
         if (!response.ok) {
             throw new Error(`mailbox_url HTTP ${response.status}: ${raw.slice(0, 300)}`);
@@ -256,20 +292,25 @@ export class MailboxUrlCodeProvider {
         return raw;
     }
 
-    async snapshot(): Promise<MailboxSnapshot> {
-        return snapshotFromRaw(await this.fetchRaw());
+    async snapshot(options: MailboxFetchOptions = {}): Promise<MailboxSnapshot> {
+        return snapshotFromRaw(await this.fetchRaw(options));
     }
 
     async waitForCode(options: MailboxWaitOptions = {}): Promise<string> {
-        const timeoutMs = Math.max(5000, Math.floor(options.timeoutMs ?? 120000));
-        const intervalMs = Math.max(1000, Math.floor(options.intervalMs ?? 3000));
+        const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? 120000));
+        const intervalMs = Math.max(1, Math.floor(options.intervalMs ?? 3000));
         const allowBaselineCodeAfterMs = Math.max(0, Math.floor(options.allowBaselineCodeAfterMs ?? 0));
+        const fetchTimeoutMs = Math.max(1, Math.floor(options.fetchTimeoutMs ?? Math.min(10000, timeoutMs)));
+        const progressIntervalMs = Math.max(intervalMs, Math.floor(options.progressIntervalMs ?? 30000));
         const startedAt = Date.now();
+        let lastProgressElapsedMs = 0;
         let lastError = "";
+        let attempt = 0;
 
         while (Date.now() - startedAt < timeoutMs) {
+            attempt += 1;
             try {
-                const snapshot = await this.snapshot();
+                const snapshot = await this.snapshot({fetchTimeoutMs});
                 if (snapshot.code) {
                     const isBaseline = sameAsBaseline(snapshot, options.baseline);
                     if (!isBaseline) {
@@ -285,6 +326,11 @@ export class MailboxUrlCodeProvider {
                 lastError = snapshot.code ? "mailbox still returns baseline code" : "mailbox returned no code";
             } catch (error) {
                 lastError = error instanceof Error ? error.message : String(error);
+            }
+            const elapsedMs = Date.now() - startedAt;
+            if (options.onProgress && elapsedMs - lastProgressElapsedMs >= progressIntervalMs) {
+                lastProgressElapsedMs = elapsedMs;
+                options.onProgress({attempt, elapsedMs, lastError: lastError || "no code"});
             }
             await sleep(intervalMs);
         }

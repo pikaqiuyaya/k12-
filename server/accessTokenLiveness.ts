@@ -6,8 +6,13 @@ export interface AccessTokenLivenessResult {
   banned?: boolean;
 }
 
+export function isOpenAiWorkspaceAccessDeniedMessage(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : String(value || "");
+  return /codex_workspace_access_denied|workspace\s+access\s+denied|workspace administrator for access|contact your chatgpt workspace administrator/i.test(message);
+}
+
 export function shouldTrySub2LivenessAfterDirectFailure(result: AccessTokenLivenessResult): boolean {
-  return !result.ok && !result.banned && (result.status === 401 || result.status === 403);
+  return !result.ok && !result.banned && result.status === 401;
 }
 
 export function combineDirectAndSub2Liveness(

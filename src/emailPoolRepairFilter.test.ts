@@ -14,6 +14,12 @@ test("K12 repair filter only accepts explicit K12 repair failures", () => {
   assert.equal(isK12RepairNeededResult({ok: false, message: "Sub2API 未找到账号"}), false);
   assert.equal(isK12RepairNeededResult({ok: false, issue: "k12-plan-mismatch"}), true);
   assert.equal(isK12RepairNeededResult({ok: false, issue: "sub2api-k12-status-error"}), true);
+  assert.equal(isK12RepairNeededResult({
+    ok: false,
+    issue: "sub2api-k12-status-error",
+    repairable: false,
+    message: "codex_workspace_access_denied",
+  }), false);
 });
 
 test("K12 repair scan replaces stale scanned results and keeps unrelated results", () => {

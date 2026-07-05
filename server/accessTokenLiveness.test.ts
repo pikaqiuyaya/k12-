@@ -3,6 +3,7 @@ import {test} from "node:test";
 
 import {
   combineDirectAndSub2Liveness,
+  isOpenAiWorkspaceAccessDeniedMessage,
   k12PlanMismatchReason,
   shouldTrySub2LivenessAfterDirectFailure,
 } from "./accessTokenLiveness";
@@ -18,9 +19,16 @@ test("tries Sub2API liveness when direct AT check returns auth failure", () => {
   assert.equal(shouldTrySub2LivenessAfterDirectFailure({
     ok: false,
     status: 403,
-    message: "AT 失效/不可用: HTTP 403",
+    message: 'Access forbidden (403): {"message":"Unauthorized: Contact your ChatGPT workspace administrator for access.","code":"codex_workspace_access_denied"}',
     latencyMs: 120,
-  }), true);
+  }), false);
+});
+
+test("recognizes OpenAI workspace access denied as terminal", () => {
+  assert.equal(isOpenAiWorkspaceAccessDeniedMessage(
+    'Access forbidden (403): {"message":"Unauthorized: Contact your ChatGPT workspace administrator for access.","code":"codex_workspace_access_denied"}',
+  ), true);
+  assert.equal(isOpenAiWorkspaceAccessDeniedMessage("HTTP 401 token expired"), false);
 });
 
 test("does not hide banned direct AT results behind Sub2API fallback", () => {

@@ -5,6 +5,9 @@ json/
 config.json
 *.log
 pool_tokens.txt
+mihono-login.txt
 auth/
 **/._*
 *.bak.*
+.codex-run-logs/
+.codex-tmp/

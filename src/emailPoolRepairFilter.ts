@@ -7,9 +7,11 @@ export interface EmailPoolRepairCheckResult {
   ok: boolean;
   issue?: string;
   message?: string;
+  repairable?: boolean;
 }
 
 export function isK12RepairNeededResult(result?: EmailPoolRepairCheckResult): boolean {
+  if (result?.repairable === false) return false;
   return Boolean(result && !result.ok && result.issue && k12RepairIssues.has(result.issue));
 }
 
