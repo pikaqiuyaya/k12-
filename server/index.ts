@@ -84,6 +84,7 @@ import {
   type AccessTokenLivenessResult,
 } from "./accessTokenLiveness";
 import {isMissingChatGptAccessTokenError} from "./chatGptSession";
+import {describeChatGptCallbackError} from "./openAiAuthCallback";
 import {
   DEFAULT_POOL_FISSION_CHILD_COOLDOWN_MS,
   DEFAULT_POOL_FISSION_MAILBOX_OTP_COOLDOWN_MS,
@@ -4368,6 +4369,10 @@ async function finishChatGptCallback(client: any, callbackUrl: string, task?: K1
   const log = (level: LogLevel, message: string) => {
     if (task) appendLog(task, level, message);
   };
+  const callbackError = describeChatGptCallbackError(callbackUrl);
+  if (callbackError) {
+    throw new Error(callbackError);
+  }
   log("info", "完成 ChatGPT callback，建立 Web session");
   const response = await client.fetch(callbackUrl, {
     method: "GET",

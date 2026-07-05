@@ -298,6 +298,7 @@ export function isOpenAiProxyRetryableAuthMessage(value: unknown): boolean {
   const message = value instanceof Error ? value.message : String(value || "");
   const networkRetryable = /(^|[\s:])(fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|UND_ERR|socket hang up|network failed|connection reset|connect timeout)([\s:]|$)/i.test(message);
   if (networkRetryable) return true;
+  if (/ChatGPT callback returned\s+access_denied|consent[ _-]?verifier[\s\S]*already[\s\S]*used/i.test(message)) return true;
   if (/workspace_id=.*HTTP\s*401|invalid_workspace_selected|no_valid_workspaces/i.test(message)) return false;
   return /完成 ChatGPT callback 失败:\s*HTTP\s*(403|429)|打开 OpenAI authorize 页失败:\s*429|auth\.openai\.com[\s\S]*HTTP\s*429|OpenAI auth[\s\S]*HTTP\s*429/i.test(message);
 }

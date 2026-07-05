@@ -103,6 +103,15 @@ test("treats OpenAI fetch network failures as proxy retryable", () => {
   assert.equal(isOpenAiProxyRetryableAuthMessage("mailbox_url request timeout after 10000ms"), false);
 });
 
+test("treats used ChatGPT callback consent verifier as proxy retryable", () => {
+  assert.equal(
+    isOpenAiProxyRetryableAuthMessage(
+      "ChatGPT callback returned access_denied: The resource owner or authorization server denied the request. The consent verifier has already been used.",
+    ),
+    true,
+  );
+});
+
 test("normalizes Mihono manager URL into public proxy text endpoint", () => {
   assert.equal(
     normalizeMihonoProxyPoolApiUrl("http://127.0.0.1:17879"),
